@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import TypeVar
+
+from pydantic import BaseModel
 
 from hivemind.config import Settings
 from hivemind.events import EventBus
@@ -40,6 +43,8 @@ from hivemind.schemas import (
     WorkerReport,
     new_id,
 )
+
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
 @dataclass(slots=True)
@@ -102,8 +107,8 @@ class HiveMindRuntime:
             "CEO is proposing prompt-specific departments.",
             agent_id=ceo.agent_id,
         )
-        plan = await self.provider.generate_structured(
-            CompanyPlan, CEO_PLAN_SYSTEM, json.dumps({"prompt": prompt})
+        plan = await self._generate(
+            run, CompanyPlan, CEO_PLAN_SYSTEM, json.dumps({"prompt": prompt})
         )
         # Learning note: a model response is only a proposal. Slicing here is a first visible
         # guardrail; the dedicated Governor later owns all related limits.
@@ -140,7 +145,8 @@ class HiveMindRuntime:
             )
             agents.append(manager)
             await self._spawn(run, manager)
-            worker_plan = await self.provider.generate_structured(
+            worker_plan = await self._generate(
+                run,
                 WorkerPlan,
                 MANAGER_PLAN_SYSTEM,
                 department.model_dump_json(),
@@ -171,7 +177,8 @@ class HiveMindRuntime:
                     else None,
                 )
                 evidence.append(item)
-                report = await self.provider.generate_structured(
+                report = await self._generate(
+                    run,
                     WorkerReport,
                     WORKER_SYSTEM,
                     json.dumps({"role_key": worker.role_key, "evidence_ids": [item.evidence_id]}),
@@ -199,7 +206,8 @@ class HiveMindRuntime:
                     },
                 )
             manager.status = AgentStatus.SYNTHESIZING
-            manager_report = await self.provider.generate_structured(
+            manager_report = await self._generate(
+                run,
                 ManagerReport,
                 MANAGER_SYNTHESIS_SYSTEM,
                 json.dumps(
@@ -224,7 +232,8 @@ class HiveMindRuntime:
 
         claims = [claim for report in manager_reports for claim in report.merged_claims]
         await self._stage(run, RunStage.VERIFYING, "Verifier is checking claim references.")
-        verification = await self.provider.generate_structured(
+        verification = await self._generate(
+            run,
             VerificationReport,
             VERIFIER_SYSTEM,
             json.dumps(
@@ -240,7 +249,8 @@ class HiveMindRuntime:
             f"Verifier checked {len(verification.findings)} claim(s).",
         )
         await self._stage(run, RunStage.QUALITY_REVIEW, "QA is reviewing coverage and evidence.")
-        qa = await self.provider.generate_structured(
+        qa = await self._generate(
+            run,
             QAReport,
             QA_SYSTEM,
             json.dumps(
@@ -274,7 +284,8 @@ class HiveMindRuntime:
                         verification_status=finding.status,
                     )
                 )
-        final_report = await self.provider.generate_structured(
+        final_report = await self._generate(
+            run,
             FinalReport,
             FINAL_SYSTEM,
             json.dumps(
@@ -338,3 +349,26 @@ class HiveMindRuntime:
             round_number=run.round_number,
             metadata={"stage": stage.value},
         )
+
+    async def _generate(
+        self,
+        run: RunRecord,
+        schema: type[SchemaT],
+        system_prompt: str,
+        user_prompt: str,
+    ) -> SchemaT:
+        """Call a provider and expose any internal schema-repair attempt as an event."""
+
+        before = int(getattr(self.provider, "validation_failures", 0))
+        try:
+            return await self.provider.generate_structured(schema, system_prompt, user_prompt)
+        finally:
+            after = int(getattr(self.provider, "validation_failures", before))
+            for _ in range(max(0, after - before)):
+                await self.events.emit(
+                    EventType.VALIDATION_FAILED,
+                    run.run_id,
+                    f"Invalid {schema.__name__} output; requested one repair.",
+                    round_number=run.round_number,
+                    metadata={"schema": schema.__name__},
+                )

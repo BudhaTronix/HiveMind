@@ -6,7 +6,7 @@ committed and pushed before work continues.
 - [x] Inspect the starting repository and lock the implementation plan.
 - [x] Create the installable project and offline demo.
 - [x] Add the live terminal dashboard.
-- [ ] Add Ollama and OpenAI providers.
+- [x] Add Ollama and OpenAI providers.
 - [ ] Add governed dynamic orchestration.
 - [ ] Add SQLite persistence, status, and resume.
 - [ ] Add safe web research and evidence.

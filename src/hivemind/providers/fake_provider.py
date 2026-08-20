@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from hivemind.providers.base import ProviderHealth
 from hivemind.schemas import (
     Claim,
     CompanyPlan,
@@ -51,6 +52,11 @@ class FakeLLMProvider:
     async def generate_text(self, system_prompt: str, user_prompt: str) -> str:
         self.call_count += 1
         return "HiveMind fake provider completed the requested educational step."
+
+    async def check_health(self) -> ProviderHealth:
+        """The offline simulator is always available once the package imports."""
+
+        return ProviderHealth(ok=True, message="Offline fake provider is ready.")
 
     async def generate_structured(
         self,
