@@ -12,5 +12,5 @@ committed and pushed before work continues.
 - [x] Add safe web research and evidence.
 - [x] Add verification, QA, and bounded replanning.
 - [x] Add scoped, curated memory.
-- [ ] Add permissions and resilience.
+- [x] Add permissions and resilience.
 - [ ] Complete tests, evaluations, and beginner documentation.

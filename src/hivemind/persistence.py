@@ -282,6 +282,42 @@ class HiveMindRepository:
                     event.model_dump_json(),
                 ),
             )
+            tool_call_id = event.metadata.get("tool_call_id")
+            tool_name = event.metadata.get("tool")
+            if tool_call_id and tool_name and event.event_type.value == "tool_started":
+                await db.execute(
+                    """
+                    INSERT OR REPLACE INTO tool_calls(
+                        tool_call_id, run_id, task_id, agent_id, tool_name,
+                        status, created_at, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(tool_call_id),
+                        event.run_id,
+                        event.task_id,
+                        event.agent_id,
+                        str(tool_name),
+                        "running",
+                        event.timestamp.isoformat(),
+                        event.model_dump_json(),
+                    ),
+                )
+            elif tool_call_id and event.event_type.value in {
+                "tool_completed",
+                "tool_failed",
+            }:
+                await db.execute(
+                    """
+                    UPDATE tool_calls SET status = ?, payload_json = ?
+                    WHERE tool_call_id = ?
+                    """,
+                    (
+                        "completed" if event.event_type.value == "tool_completed" else "failed",
+                        event.model_dump_json(),
+                        str(tool_call_id),
+                    ),
+                )
             await db.commit()
 
     async def list_events(self, run_id: str) -> list[HiveEvent]:

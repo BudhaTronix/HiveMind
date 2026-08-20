@@ -23,7 +23,7 @@ from hivemind.agents import (
     run_worker,
 )
 from hivemind.config import Settings
-from hivemind.events import EventBus
+from hivemind.events import EventBus, redact_text
 from hivemind.governor import Governor
 from hivemind.memory import MemoryStore, create_memory_store
 from hivemind.persistence import ArtifactStore, HiveMindRepository
@@ -120,12 +120,14 @@ class HiveMindRuntime:
         self.tools = tool_registry or build_default_tool_registry()
         self.memory_store = memory_store or create_memory_store(settings, repository)
         self.memory_candidates: list[tuple[MemoryCandidate, str]] = []
+        self._active_run: RunRecord | None = None
         self.web_semaphore = asyncio.Semaphore(self.governor.limits.max_concurrent_web_requests)
         self.executor = AgentExecutor(
             provider,
             event_bus,
             max_concurrent_calls=self.governor.limits.max_concurrent_llm_calls,
-            max_attempts=self.governor.limits.max_retries_per_task,
+            max_attempts=self.governor.limits.max_retries_per_task + 1,
+            call_timeout_seconds=min(180, self.governor.limits.max_runtime_seconds),
             repository=repository,
         )
 
@@ -135,6 +137,35 @@ class HiveMindRuntime:
         *,
         project_id: str = "demo-project",
         existing_run: RunRecord | None = None,
+    ) -> RuntimeResult:
+        """Enforce a whole-run deadline and persist terminal failure state."""
+
+        try:
+            async with asyncio.timeout(self.governor.limits.max_runtime_seconds):
+                return await self._run_workflow(
+                    prompt, project_id=project_id, existing_run=existing_run
+                )
+        except asyncio.CancelledError:
+            await self._record_run_failure("Run was cancelled.", cancelled=True)
+            raise
+        except TimeoutError as exc:
+            await self._record_run_failure(
+                f"Run exceeded {self.governor.limits.max_runtime_seconds} seconds."
+            )
+            raise RuntimeError(
+                f"HiveMind exceeded the {self.governor.limits.max_runtime_seconds}-second "
+                "runtime limit."
+            ) from exc
+        except Exception as exc:
+            await self._record_run_failure(str(exc))
+            raise
+
+    async def _run_workflow(
+        self,
+        prompt: str,
+        *,
+        project_id: str,
+        existing_run: RunRecord | None,
     ) -> RuntimeResult:
         """Complete a governed research round and synthesize partial results safely."""
 
@@ -149,6 +180,7 @@ class HiveMindRuntime:
         # Incomplete resume replays stage scheduling from round one, while the executor
         # reuses each valid per-round task output instead of making another model call.
         run.round_number = 1 if existing_run else max(1, run.round_number)
+        self._active_run = run
         if self.repository:
             await self.repository.create_project(project_id, project_id)
             await self.repository.save_run(run)
@@ -365,6 +397,29 @@ class HiveMindRuntime:
         )
         await self._persist_completed_run(result)
         return result
+
+    async def _record_run_failure(self, error: str, *, cancelled: bool = False) -> None:
+        """Best-effort persistence for unexpected terminal failures."""
+
+        run = self._active_run
+        if run is None:
+            return
+        safe_error = redact_text(error)[:500]
+        run.stage = RunStage.CANCELLED if cancelled else RunStage.FAILED
+        run.error_message = safe_error
+        run.updated_at = utc_now()
+        try:
+            if self.repository:
+                await self.repository.save_run(run)
+            await self.events.emit(
+                EventType.RUN_FAILED,
+                run.run_id,
+                "Run was cancelled." if cancelled else "Run failed before completion.",
+                round_number=run.round_number,
+                metadata={"error": safe_error, "stage": run.stage.value},
+            )
+        except Exception:  # noqa: BLE001 - preserve the original failure during cleanup.
+            return
 
     async def resume(self, run_id: str) -> RuntimeResult:
         """Return a completed checkpoint or restart the earliest incomplete stage."""
@@ -860,6 +915,7 @@ class HiveMindRuntime:
 
         collected: list[Evidence] = []
         for query in spec.search_queries:
+            tool_call_id = new_id("toolcall")
             await self.events.emit(
                 EventType.TOOL_STARTED,
                 run.run_id,
@@ -867,7 +923,11 @@ class HiveMindRuntime:
                 round_number=run.round_number,
                 task_id=task_id,
                 agent_id=worker.agent_id,
-                metadata={"tool": "web_search", "query": query},
+                metadata={
+                    "tool": "web_search",
+                    "query": query,
+                    "tool_call_id": tool_call_id,
+                },
             )
             try:
                 async with self.web_semaphore:
@@ -878,7 +938,7 @@ class HiveMindRuntime:
                         max_results=3,
                     )
             except Exception as exc:  # noqa: BLE001 - tool failure stays local to the worker.
-                await self._tool_failed(run, worker, task_id, "web_search", exc)
+                await self._tool_failed(run, worker, task_id, tool_call_id, "web_search", exc)
                 continue
             await self.events.emit(
                 EventType.TOOL_COMPLETED,
@@ -887,7 +947,11 @@ class HiveMindRuntime:
                 round_number=run.round_number,
                 task_id=task_id,
                 agent_id=worker.agent_id,
-                metadata={"tool": "web_search", "results": len(results)},
+                metadata={
+                    "tool": "web_search",
+                    "results": len(results),
+                    "tool_call_id": tool_call_id,
+                },
             )
             query_evidence = [
                 Evidence(
@@ -920,6 +984,7 @@ class HiveMindRuntime:
         """Enrich one search snippet with a bounded page excerpt when safe and available."""
 
         assert evidence.url is not None
+        tool_call_id = new_id("toolcall")
         await self.events.emit(
             EventType.TOOL_STARTED,
             run.run_id,
@@ -927,7 +992,11 @@ class HiveMindRuntime:
             round_number=run.round_number,
             task_id=task_id,
             agent_id=worker.agent_id,
-            metadata={"tool": "web_fetch", "url": evidence.url},
+            metadata={
+                "tool": "web_fetch",
+                "url": evidence.url,
+                "tool_call_id": tool_call_id,
+            },
         )
         try:
             async with self.web_semaphore:
@@ -937,7 +1006,7 @@ class HiveMindRuntime:
                     url=evidence.url,
                 )
         except Exception as exc:  # noqa: BLE001 - the search snippet remains usable evidence.
-            await self._tool_failed(run, worker, task_id, "web_fetch", exc)
+            await self._tool_failed(run, worker, task_id, tool_call_id, "web_fetch", exc)
             return
         evidence.url = page.url
         evidence.title = page.title or evidence.title
@@ -950,7 +1019,11 @@ class HiveMindRuntime:
             round_number=run.round_number,
             task_id=task_id,
             agent_id=worker.agent_id,
-            metadata={"tool": "web_fetch", "url": page.url},
+            metadata={
+                "tool": "web_fetch",
+                "url": page.url,
+                "tool_call_id": tool_call_id,
+            },
         )
 
     async def _tool_failed(
@@ -958,6 +1031,7 @@ class HiveMindRuntime:
         run: RunRecord,
         worker: AgentProfile,
         task_id: str,
+        tool_call_id: str,
         tool: str,
         error: Exception,
     ) -> None:
@@ -968,7 +1042,11 @@ class HiveMindRuntime:
             round_number=run.round_number,
             task_id=task_id,
             agent_id=worker.agent_id,
-            metadata={"tool": tool, "error": str(error)[:300]},
+            metadata={
+                "tool": tool,
+                "tool_call_id": tool_call_id,
+                "error": str(error)[:300],
+            },
         )
 
     async def _publish_governor_decision(self, run: RunRecord, reductions: tuple[str, ...]) -> None:

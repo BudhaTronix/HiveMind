@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel
 
-from hivemind.events import EventBus
+from hivemind.events import EventBus, redact_text
 from hivemind.prompts import (
     CEO_FOLLOW_UP_SYSTEM,
     CEO_PLAN_SYSTEM,
@@ -25,7 +25,7 @@ from hivemind.prompts import (
     VERIFIER_SYSTEM,
     WORKER_SYSTEM,
 )
-from hivemind.providers.base import LLMProvider
+from hivemind.providers.base import LLMProvider, ProviderError
 from hivemind.schemas import (
     AgentProfile,
     AgentStatus,
@@ -65,12 +65,14 @@ class AgentExecutor:
         *,
         max_concurrent_calls: int,
         max_attempts: int = 2,
+        call_timeout_seconds: float = 180,
         repository: HiveMindRepository | None = None,
     ) -> None:
         self.provider = provider
         self.events = event_bus
         self.semaphore = asyncio.Semaphore(max_concurrent_calls)
         self.max_attempts = max_attempts
+        self.call_timeout_seconds = call_timeout_seconds
         self.repository = repository
 
     async def structured(
@@ -135,30 +137,64 @@ class AgentExecutor:
         )
         # Learning note: a semaphore bounds requests made by this Python process. A local
         # model server may still serialize work internally depending on its own resources.
-        try:
-            async with self.semaphore:
-                before = int(getattr(self.provider, "validation_failures", 0))
-                result = await self.provider.generate_structured(
-                    schema, system_prompt, json.dumps(payload)
-                )
-                after = int(getattr(self.provider, "validation_failures", before))
-                for _ in range(max(0, after - before)):
-                    await self.events.emit(
-                        EventType.VALIDATION_FAILED,
-                        run.run_id,
-                        f"Invalid {schema.__name__} output; requested one repair.",
-                        round_number=run.round_number,
-                        agent_id=agent.agent_id,
-                        task_id=task.task_id,
-                        metadata={"schema": schema.__name__},
-                    )
-        except Exception as exc:
-            task.status = TaskStatus.FAILED
-            task.completed_at = utc_now()
-            task.error_message = str(exc)[:500]
+        result: SchemaT | None = None
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            task.attempt = attempt
+            task.status = TaskStatus.RUNNING
             if self.repository:
                 await self.repository.save_task(task)
-            raise
+            before = int(getattr(self.provider, "validation_failures", 0))
+            try:
+                async with self.semaphore:
+                    async with asyncio.timeout(self.call_timeout_seconds):
+                        result = await self.provider.generate_structured(
+                            schema, system_prompt, json.dumps(payload)
+                        )
+            except Exception as exc:  # noqa: BLE001 - retry policy classifies the exception.
+                last_error = exc
+            after = int(getattr(self.provider, "validation_failures", before))
+            for _ in range(max(0, after - before)):
+                await self.events.emit(
+                    EventType.VALIDATION_FAILED,
+                    run.run_id,
+                    f"Invalid {schema.__name__} output; requested one repair.",
+                    round_number=run.round_number,
+                    agent_id=agent.agent_id,
+                    task_id=task.task_id,
+                    metadata={"schema": schema.__name__},
+                )
+            if result is not None:
+                break
+            retryable = not isinstance(last_error, ProviderError) or last_error.retryable
+            if not retryable or attempt >= self.max_attempts:
+                task.status = TaskStatus.FAILED
+                task.completed_at = utc_now()
+                task.error_message = redact_text(str(last_error))[:500]
+                if self.repository:
+                    await self.repository.save_task(task)
+                assert last_error is not None
+                raise last_error
+            task.status = TaskStatus.RETRYING
+            agent.status = AgentStatus.RETRYING
+            if self.repository:
+                await self.repository.save_task(task)
+            await self.events.emit(
+                EventType.TASK_RETRYING,
+                run.run_id,
+                f"{agent.name} will retry after attempt {attempt}.",
+                round_number=run.round_number,
+                agent_id=agent.agent_id,
+                task_id=task.task_id,
+                metadata={
+                    "status": AgentStatus.RETRYING.value,
+                    "attempt": attempt + 1,
+                    "max_attempts": self.max_attempts,
+                    "error": str(last_error)[:300],
+                },
+            )
+            await asyncio.sleep(min(0.25 * (2 ** (attempt - 1)), 2.0))
+        assert result is not None
         task.status = TaskStatus.COMPLETED
         task.completed_at = utc_now()
         if self.repository:

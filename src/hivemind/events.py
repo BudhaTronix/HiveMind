@@ -15,6 +15,20 @@ from hivemind.schemas import EventType, HiveEvent
 EventSink = Callable[[HiveEvent], Awaitable[None]]
 
 _SECRET_KEYS = re.compile(r"(api[_-]?key|authorization|cookie|token|secret)", re.IGNORECASE)
+_SECRET_VALUES = [
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]+=*", re.IGNORECASE),
+    re.compile(r"(?i)(api[_-]?key|token|secret|authorization)=([^&\s]+)"),
+]
+
+
+def redact_text(value: str) -> str:
+    """Remove common credential forms from arbitrary messages and string values."""
+
+    result = value
+    for pattern in _SECRET_VALUES:
+        result = pattern.sub("[REDACTED]", result)
+    return result
 
 
 def redact(value: Any, *, key: str = "") -> Any:
@@ -22,6 +36,8 @@ def redact(value: Any, *, key: str = "") -> Any:
 
     if key and _SECRET_KEYS.search(key):
         return "[REDACTED]"
+    if isinstance(value, str):
+        return redact_text(value)
     if isinstance(value, dict):
         return {str(item_key): redact(item, key=str(item_key)) for item_key, item in value.items()}
     if isinstance(value, list):
@@ -58,7 +74,7 @@ class EventBus:
         event = HiveEvent(
             event_type=event_type,
             run_id=run_id,
-            message=message,
+            message=redact_text(message),
             round_number=round_number,
             task_id=task_id,
             agent_id=agent_id,

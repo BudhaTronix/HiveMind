@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin
 
@@ -26,12 +27,25 @@ class ToolError(RuntimeError):
 ToolHandler = Callable[..., Awaitable[Any]]
 
 
+@dataclass(slots=True)
+class ApprovalGate:
+    """Fail-closed approval extension point for future consequential tools."""
+
+    async def request_approval(
+        self, metadata: ToolMetadata, *, agent_kind: AgentKind, arguments: dict[str, Any]
+    ) -> bool:
+        """Reject by default; an interactive application may provide another gate."""
+
+        return False
+
+
 class ToolRegistry:
     """Store Python-owned tool metadata and handlers."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, approval_gate: ApprovalGate | None = None) -> None:
         self._metadata: dict[str, ToolMetadata] = {}
         self._handlers: dict[str, ToolHandler] = {}
+        self.approval_gate = approval_gate
 
     def register(self, metadata: ToolMetadata, handler: ToolHandler) -> None:
         """Register one explicit tool; duplicate names replace development-time adapters."""
@@ -51,6 +65,13 @@ class ToolRegistry:
         metadata = self.metadata(name)
         if agent_kind not in metadata.allowed_agent_kinds:
             raise PermissionError(f"{agent_kind.value} agents may not use {name}.")
+        if metadata.requires_approval and (
+            self.approval_gate is None
+            or not await self.approval_gate.request_approval(
+                metadata, agent_kind=agent_kind, arguments=kwargs
+            )
+        ):
+            raise PermissionError(f"{name} requires approval and was not approved.")
         return await self._handlers[name](**kwargs)
 
 
