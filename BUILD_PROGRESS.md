@@ -13,4 +13,8 @@ committed and pushed before work continues.
 - [x] Add verification, QA, and bounded replanning.
 - [x] Add scoped, curated memory.
 - [x] Add permissions and resilience.
-- [ ] Complete tests, evaluations, and beginner documentation.
+- [x] Complete tests, evaluations, and beginner documentation.
+
+Final acceptance baseline: 44 deterministic tests, 10 offline evaluation scenarios, Ruff
+formatting/linting, an offline CLI demo, persisted artifact validation, status reconstruction,
+resume reuse, command help, and provider diagnostics.

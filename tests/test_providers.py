@@ -5,9 +5,13 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+from hivemind.config import Settings
+from hivemind.events import EventBus
 from hivemind.providers.base import ValidatingProvider
 from hivemind.providers.ollama_provider import OllamaProvider
 from hivemind.providers.openai_provider import OpenAIProvider
+from hivemind.runtime import HiveMindRuntime
+from hivemind.schemas import AgentKind, AgentProfile
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -72,3 +76,43 @@ async def test_openai_health_does_not_make_request_without_key() -> None:
 
     assert not health.ok
     assert "OPENAI_API_KEY" in health.message
+
+
+def test_runtime_routes_a_role_model_and_reuses_the_adapter(monkeypatch) -> None:
+    created_models: list[str] = []
+
+    class StubProvider:
+        name = "ollama"
+
+        def __init__(self, model: str) -> None:
+            self.model = model
+
+    def stub_create_provider(settings: Settings) -> StubProvider:
+        created_models.append(settings.ollama_model)
+        return StubProvider(settings.ollama_model)
+
+    monkeypatch.setattr("hivemind.runtime.create_provider", stub_create_provider)
+    settings = Settings(
+        HIVEMIND_PROVIDER="ollama",
+        OLLAMA_MODEL="base-model",
+        HIVEMIND_MODEL_WORKER="worker-model",
+    )
+    runtime = HiveMindRuntime(
+        settings,
+        StubProvider("base-model"),  # type: ignore[arg-type]
+        EventBus(),
+    )
+    worker = AgentProfile(
+        project_id="project",
+        role_key="researcher",
+        name="Researcher",
+        kind=AgentKind.WORKER,
+        role_description="Research one bounded question.",
+    )
+
+    first = runtime._provider_for_agent(worker)
+    second = runtime._provider_for_agent(worker)
+
+    assert first.model == "worker-model"
+    assert second is first
+    assert created_models == ["worker-model"]

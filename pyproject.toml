@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mem0 = ["mem0ai>=0.1,<2"]
+mem0 = ["mem0ai>=2.0.16,<3"]
 dev = [
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.24,<2",
@@ -50,4 +50,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-

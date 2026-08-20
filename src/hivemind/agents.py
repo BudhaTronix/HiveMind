@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel
@@ -67,6 +68,7 @@ class AgentExecutor:
         max_attempts: int = 2,
         call_timeout_seconds: float = 180,
         repository: HiveMindRepository | None = None,
+        provider_router: Callable[[AgentProfile], LLMProvider] | None = None,
     ) -> None:
         self.provider = provider
         self.events = event_bus
@@ -74,6 +76,7 @@ class AgentExecutor:
         self.max_attempts = max_attempts
         self.call_timeout_seconds = call_timeout_seconds
         self.repository = repository
+        self.provider_router = provider_router
 
     async def structured(
         self,
@@ -89,6 +92,7 @@ class AgentExecutor:
         """Make one validated model call while respecting global concurrency."""
 
         agent.status = status
+        active_provider = self.provider_router(agent) if self.provider_router else self.provider
         title = f"Round {run.round_number}: Produce {schema.__name__}"
         if task_label:
             title += f" ({task_label})"
@@ -144,16 +148,16 @@ class AgentExecutor:
             task.status = TaskStatus.RUNNING
             if self.repository:
                 await self.repository.save_task(task)
-            before = int(getattr(self.provider, "validation_failures", 0))
+            before = int(getattr(active_provider, "validation_failures", 0))
             try:
                 async with self.semaphore:
                     async with asyncio.timeout(self.call_timeout_seconds):
-                        result = await self.provider.generate_structured(
+                        result = await active_provider.generate_structured(
                             schema, system_prompt, json.dumps(payload)
                         )
             except Exception as exc:  # noqa: BLE001 - retry policy classifies the exception.
                 last_error = exc
-            after = int(getattr(self.provider, "validation_failures", before))
+            after = int(getattr(active_provider, "validation_failures", before))
             for _ in range(max(0, after - before)):
                 await self.events.emit(
                     EventType.VALIDATION_FAILED,

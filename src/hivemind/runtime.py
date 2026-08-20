@@ -27,6 +27,7 @@ from hivemind.events import EventBus, redact_text
 from hivemind.governor import Governor
 from hivemind.memory import MemoryStore, create_memory_store
 from hivemind.persistence import ArtifactStore, HiveMindRepository
+from hivemind.providers import create_provider
 from hivemind.providers.base import LLMProvider
 from hivemind.registry import AgentRegistry
 from hivemind.schemas import (
@@ -121,6 +122,7 @@ class HiveMindRuntime:
         self.memory_store = memory_store or create_memory_store(settings, repository)
         self.memory_candidates: list[tuple[MemoryCandidate, str]] = []
         self._active_run: RunRecord | None = None
+        self._role_providers: dict[AgentKind, LLMProvider] = {}
         self.web_semaphore = asyncio.Semaphore(self.governor.limits.max_concurrent_web_requests)
         self.executor = AgentExecutor(
             provider,
@@ -129,6 +131,7 @@ class HiveMindRuntime:
             max_attempts=self.governor.limits.max_retries_per_task + 1,
             call_timeout_seconds=min(180, self.governor.limits.max_runtime_seconds),
             repository=repository,
+            provider_router=self._provider_for_agent,
         )
 
     async def run(
@@ -420,6 +423,25 @@ class HiveMindRuntime:
             )
         except Exception:  # noqa: BLE001 - preserve the original failure during cleanup.
             return
+
+    def _provider_for_agent(self, agent: AgentProfile) -> LLMProvider:
+        """Lazily honor an optional role model while keeping one provider type per run."""
+
+        role_setting = {
+            AgentKind.CEO: self.settings.model_ceo,
+            AgentKind.MANAGER: self.settings.model_manager,
+            AgentKind.WORKER: self.settings.model_worker,
+            AgentKind.VERIFIER: self.settings.model_verifier,
+            AgentKind.QA: self.settings.model_qa,
+            AgentKind.MEMORY_CURATOR: self.settings.model_memory,
+        }[agent.kind]
+        if not role_setting or self.provider.name == "fake":
+            return self.provider
+        if agent.kind not in self._role_providers:
+            key = "openai_model" if self.provider.name == "openai" else "ollama_model"
+            role_settings = self.settings.model_copy(update={key: role_setting})
+            self._role_providers[agent.kind] = create_provider(role_settings)
+        return self._role_providers[agent.kind]
 
     async def resume(self, run_id: str) -> RuntimeResult:
         """Return a completed checkpoint or restart the earliest incomplete stage."""

@@ -3,7 +3,7 @@
 import pytest
 
 from hivemind.schemas import AgentKind, ToolMetadata
-from hivemind.tools import ApprovalGate, ToolRegistry
+from hivemind.tools import ApprovalGate, ToolRegistry, build_default_tool_registry
 
 
 async def test_worker_cannot_use_manager_only_tool() -> None:
@@ -77,3 +77,24 @@ async def test_explicit_approval_gate_can_allow_future_tool() -> None:
     )
 
     assert await registry.execute("approved_tool", agent_kind=AgentKind.CEO) == "approved"
+
+
+async def test_default_evidence_tool_is_registered_and_role_checked() -> None:
+    registry = build_default_tool_registry()
+    evidence = {"evidence_1": {"title": "Saved source"}}
+
+    result = await registry.execute(
+        "evidence_read",
+        agent_kind=AgentKind.VERIFIER,
+        evidence_by_id=evidence,
+        evidence_id="evidence_1",
+    )
+
+    assert result == evidence["evidence_1"]
+    with pytest.raises(PermissionError, match="may not use"):
+        await registry.execute(
+            "evidence_read",
+            agent_kind=AgentKind.WORKER,
+            evidence_by_id=evidence,
+            evidence_id="evidence_1",
+        )

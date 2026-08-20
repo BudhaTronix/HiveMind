@@ -1,0 +1,56 @@
+[
+  {
+    "name": "simple factual research",
+    "prompt": "Research the benefits and risks of solar energy",
+    "max_rounds": 1
+  },
+  {
+    "name": "market analysis",
+    "prompt": "Should a startup enter the German EV charging market?",
+    "max_rounds": 2
+  },
+  {
+    "name": "technical architecture research",
+    "prompt": "Research a secure scalable software architecture",
+    "max_rounds": 2
+  },
+  {
+    "name": "ambiguous prompt",
+    "prompt": "Research whether this is a good idea",
+    "max_rounds": 1
+  },
+  {
+    "name": "conflicting evidence",
+    "prompt": "Research conflicting views about a startup market",
+    "max_rounds": 2
+  },
+  {
+    "name": "one worker failure",
+    "prompt": "Research a startup market",
+    "fail_roles": ["market-research-demand"],
+    "max_rounds": 2
+  },
+  {
+    "name": "web disabled",
+    "prompt": "Research a technical system without web access",
+    "max_rounds": 1
+  },
+  {
+    "name": "memory retrieval",
+    "prompt": "Research a startup market and reuse project lessons",
+    "repeat_project": true,
+    "max_rounds": 2
+  },
+  {
+    "name": "QA requests follow-up",
+    "prompt": "Research a startup market with a coverage gap",
+    "max_rounds": 2
+  },
+  {
+    "name": "governor round clamp",
+    "prompt": "Research a broad technical and market question",
+    "max_rounds": 1,
+    "max_managers": 2
+  }
+]
+

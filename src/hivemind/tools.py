@@ -200,4 +200,42 @@ def build_default_tool_registry() -> ToolRegistry:
         ),
         WebFetchTool(),
     )
+    registry.register(
+        ToolMetadata(
+            name="memory_search",
+            description="Retrieve a few scoped memories from the configured memory store.",
+            allowed_agent_kinds={
+                AgentKind.CEO,
+                AgentKind.MANAGER,
+                AgentKind.WORKER,
+                AgentKind.QA,
+                AgentKind.MEMORY_CURATOR,
+            },
+        ),
+        _memory_search,
+    )
+    registry.register(
+        ToolMetadata(
+            name="evidence_read",
+            description="Read one evidence record already collected for the current run.",
+            allowed_agent_kinds={
+                AgentKind.CEO,
+                AgentKind.MANAGER,
+                AgentKind.VERIFIER,
+                AgentKind.QA,
+            },
+        ),
+        _evidence_read,
+    )
     return registry
+
+
+async def _memory_search(*, memory_store: Any, query: str, scopes: list[Any]) -> Any:
+    return await memory_store.search(query, scopes, limit=5)
+
+
+async def _evidence_read(*, evidence_by_id: dict[str, Any], evidence_id: str) -> Any:
+    try:
+        return evidence_by_id[evidence_id]
+    except KeyError as exc:
+        raise ToolError(f"Unknown evidence ID: {evidence_id}") from exc
