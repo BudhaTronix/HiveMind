@@ -77,8 +77,14 @@ class HiveMindRuntime:
         agents: list[AgentProfile] = []
         evidence: list[Evidence] = []
         manager_reports: list[ManagerReport] = []
+        run.round_number = 1
 
-        await self.events.emit(EventType.RUN_CREATED, run.run_id, f"Created run {run.run_id}.")
+        await self.events.emit(
+            EventType.RUN_CREATED,
+            run.run_id,
+            f"Created run {run.run_id}.",
+            round_number=run.round_number,
+        )
         ceo = AgentProfile(
             project_id=project_id,
             role_key="ceo",
@@ -178,6 +184,19 @@ class HiveMindRuntime:
                     f"{worker.name} completed with {len(report.claims)} claim(s).",
                     agent_id=worker.agent_id,
                     parent_agent_id=manager.agent_id,
+                    round_number=run.round_number,
+                    metadata={
+                        "status": worker.status.value,
+                        "claims": len(report.claims),
+                        "evidence": 1,
+                        "claims_added": len(report.claims),
+                        "evidence_added": 1,
+                        "llm_calls": 1,
+                        "learning_note": (
+                            "Demo evidence is labelled synthetic; real web content is treated "
+                            "as untrusted data and never as instructions."
+                        ),
+                    },
                 )
             manager.status = AgentStatus.SYNTHESIZING
             manager_report = await self.provider.generate_structured(
@@ -199,6 +218,8 @@ class HiveMindRuntime:
                 f"{manager.name} synthesized {len(reports)} worker report(s).",
                 agent_id=manager.agent_id,
                 parent_agent_id=ceo.agent_id,
+                round_number=run.round_number,
+                metadata={"status": manager.status.value, "llm_calls": 1},
             )
 
         claims = [claim for report in manager_reports for claim in report.merged_claims]
@@ -267,6 +288,14 @@ class HiveMindRuntime:
             ),
         )
         ceo.status = AgentStatus.COMPLETED
+        await self.events.emit(
+            EventType.AGENT_COMPLETED,
+            run.run_id,
+            "CEO Agent completed final synthesis.",
+            round_number=run.round_number,
+            agent_id=ceo.agent_id,
+            metadata={"status": ceo.status.value, "llm_calls": 1},
+        )
         await self._stage(run, RunStage.COMPLETED, "Research workflow completed.")
         await self.events.emit(
             EventType.RUN_COMPLETED,
@@ -292,9 +321,20 @@ class HiveMindRuntime:
             f"Created {agent.name} ({agent.kind.value}).",
             agent_id=agent.agent_id,
             parent_agent_id=agent.parent_agent_id,
-            metadata={"name": agent.name, "kind": agent.kind.value},
+            metadata={
+                "name": agent.name,
+                "kind": agent.kind.value,
+                "status": agent.status.value,
+            },
+            round_number=run.round_number,
         )
 
     async def _stage(self, run: RunRecord, stage: RunStage, message: str) -> None:
         run.stage = stage
-        await self.events.emit(EventType.STAGE_CHANGED, run.run_id, message)
+        await self.events.emit(
+            EventType.STAGE_CHANGED,
+            run.run_id,
+            message,
+            round_number=run.round_number,
+            metadata={"stage": stage.value},
+        )

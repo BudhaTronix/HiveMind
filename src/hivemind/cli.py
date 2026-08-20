@@ -50,6 +50,14 @@ async def _demo(prompt: str, *, plain: bool, explain: bool) -> None:
     event_bus = EventBus()
     renderer = TerminalRenderer(console=console, plain=plain, explain=explain)
     event_bus.subscribe(renderer.handle)
-    renderer.show_header(prompt=prompt, provider=provider.name, model=provider.model)
-    result = await HiveMindRuntime(settings, provider, event_bus).run(prompt)
+    renderer.start(
+        prompt=prompt,
+        provider=provider.name,
+        model=provider.model,
+        max_rounds=settings.max_research_rounds,
+    )
+    try:
+        result = await HiveMindRuntime(settings, provider, event_bus).run(prompt)
+    finally:
+        renderer.stop()
     renderer.show_report(result.final_report)
