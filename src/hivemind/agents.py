@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from hivemind.events import EventBus
 from hivemind.prompts import (
+    CEO_FOLLOW_UP_SYSTEM,
     CEO_PLAN_SYSTEM,
     FINAL_SYSTEM,
     MANAGER_PLAN_SYSTEM,
@@ -31,6 +32,7 @@ from hivemind.schemas import (
     EventType,
     Evidence,
     FinalReport,
+    FollowUpPlan,
     ManagerReport,
     QAReport,
     RunRecord,
@@ -80,7 +82,7 @@ class AgentExecutor:
         """Make one validated model call while respecting global concurrency."""
 
         agent.status = status
-        title = f"Produce {schema.__name__}"
+        title = f"Round {run.round_number}: Produce {schema.__name__}"
         if self.repository:
             cached = await self.repository.get_completed_task_output(
                 run.run_id, agent.agent_id, title
@@ -162,6 +164,31 @@ async def run_ceo_planner(
 ) -> CompanyPlan:
     return await executor.structured(
         run, ceo, CompanyPlan, CEO_PLAN_SYSTEM, {"prompt": run.prompt}, status=AgentStatus.PLANNING
+    )
+
+
+async def run_ceo_follow_up_planner(
+    executor: AgentExecutor,
+    run: RunRecord,
+    ceo: AgentProfile,
+    qa: QAReport,
+    verification: VerificationReport,
+) -> FollowUpPlan:
+    """Ask for only the additional organization needed to close QA gaps."""
+
+    return await executor.structured(
+        run,
+        ceo,
+        FollowUpPlan,
+        CEO_FOLLOW_UP_SYSTEM,
+        {
+            "identified_gaps": qa.identified_gaps,
+            "follow_up_questions": qa.follow_up_questions,
+            "verification_findings": [
+                item.model_dump(mode="json") for item in verification.findings
+            ],
+        },
+        status=AgentStatus.PLANNING,
     )
 
 
@@ -286,6 +313,8 @@ async def run_final_synthesis(
     run: RunRecord,
     ceo: AgentProfile,
     verification: VerificationReport,
+    qa: QAReport,
+    manager_reports: list[ManagerReport],
     sources: list[BaseModel],
 ) -> FinalReport:
     return await executor.structured(
@@ -298,6 +327,8 @@ async def run_final_synthesis(
             "verification_findings": [
                 item.model_dump(mode="json") for item in verification.findings
             ],
+            "qa": qa.model_dump(mode="json"),
+            "manager_reports": [item.model_dump(mode="json") for item in manager_reports],
             "sources": [item.model_dump(mode="json") for item in sources],
         },
         status=AgentStatus.SYNTHESIZING,

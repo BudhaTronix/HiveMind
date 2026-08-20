@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from hivemind.agents import (
     AgentExecutor,
+    run_ceo_follow_up_planner,
     run_ceo_planner,
     run_final_synthesis,
     run_manager_planner,
@@ -135,7 +136,9 @@ class HiveMindRuntime:
             max_rounds=self.governor.limits.max_research_rounds,
             round_number=1,
         )
-        run.round_number = max(1, run.round_number)
+        # Incomplete resume replays stage scheduling from round one, while the executor
+        # reuses each valid per-round task output instead of making another model call.
+        run.round_number = 1 if existing_run else max(1, run.round_number)
         if self.repository:
             await self.repository.create_project(project_id, project_id)
             await self.repository.save_run(run)
@@ -190,73 +193,14 @@ class HiveMindRuntime:
             if self.repository:
                 await self.repository.save_artifact(run.run_id, "plan", path)
 
-        await self._stage(run, RunStage.SPAWNING_MANAGERS, "Creating approved managers.")
-        managers = [await self._manager_profile(project_id, ceo, item) for item in plan.departments]
-        agents.extend(managers)
-        for manager in managers:
-            await self._spawn(run, manager)
-
-        await self._stage(
-            run, RunStage.MANAGERS_PLANNING, "Managers are planning teams concurrently."
+        manager_reports = await self._run_departments(
+            run,
+            project_id,
+            ceo,
+            plan.departments,
+            agents,
+            evidence,
         )
-        manager_plan_results = await asyncio.gather(
-            *[
-                self._plan_manager(run, manager, department)
-                for manager, department in zip(managers, plan.departments, strict=True)
-            ],
-            return_exceptions=True,
-        )
-
-        await self._stage(run, RunStage.SPAWNING_WORKERS, "Creating approved workers.")
-        teams: list[DepartmentTeam] = []
-        # Reserve supporting agents up front so the final organization never exceeds the
-        # configured total when verifier, QA, and memory curator are added.
-        counted_agents = 1 + len(managers) + _SUPPORTING_AGENT_RESERVE
-        for department, manager, proposed_workers in zip(
-            plan.departments, managers, manager_plan_results, strict=True
-        ):
-            if isinstance(proposed_workers, BaseException):
-                manager.status = AgentStatus.FAILED
-                await self._agent_failed(run, manager, str(proposed_workers))
-                teams.append(DepartmentTeam(department, manager, []))
-                continue
-            worker_decision = self.governor.validate_worker_plan(
-                proposed_workers, current_organization_agents=counted_agents
-            )
-            assert isinstance(worker_decision.plan, WorkerPlan)
-            await self._publish_governor_decision(run, worker_decision.reductions)
-            worker_profiles = []
-            for spec in worker_decision.plan.workers:
-                profile = await self._profile(
-                    project_id,
-                    role_key=spec.role_key,
-                    name=spec.name,
-                    kind=AgentKind.WORKER,
-                    objective=spec.objective,
-                    parent_agent_id=manager.agent_id,
-                    status=AgentStatus.QUEUED,
-                )
-                worker_profiles.append((spec, profile))
-            counted_agents += len(worker_profiles)
-            agents.extend(profile for _, profile in worker_profiles)
-            for _, profile in worker_profiles:
-                await self._spawn(run, profile)
-            teams.append(DepartmentTeam(department, manager, worker_profiles))
-
-        await self._stage(
-            run, RunStage.WORKERS_RESEARCHING, "Approved workers are researching concurrently."
-        )
-        department_results = await asyncio.gather(
-            *[self._execute_department(run, team, evidence) for team in teams],
-            return_exceptions=True,
-        )
-        manager_reports: list[ManagerReport] = []
-        for team, result in zip(teams, department_results, strict=True):
-            if isinstance(result, BaseException):
-                await self._agent_failed(run, team.manager, str(result))
-                manager_reports.append(_fallback_manager_report(team, str(result)))
-            else:
-                manager_reports.append(result)
 
         verifier = await self._profile(
             project_id,
@@ -278,77 +222,79 @@ class HiveMindRuntime:
         await self._spawn(run, verifier)
         await self._spawn(run, qa_agent)
 
-        claims = [claim for report in manager_reports for claim in report.merged_claims]
-        await self._stage(run, RunStage.VERIFYING, "Verifier is checking claim references.")
-        await self.events.emit(
-            EventType.VERIFICATION_STARTED,
-            run.run_id,
-            f"Verifier is checking {len(claims)} claim(s).",
-            round_number=run.round_number,
-            agent_id=verifier.agent_id,
-        )
-        verification = await run_verifier(
-            self.executor,
+        verification, qa = await self._verify_and_review(
             run,
             verifier,
-            claims,
+            qa_agent,
+            manager_reports,
             evidence,
-        )
-        if self.repository:
-            await self.repository.save_report(
-                run.run_id, "verification", verification, round_number=run.round_number
-            )
-        if self.artifacts:
-            path = await self.artifacts.write_json(run.run_id, "verification.json", verification)
-            if self.repository:
-                await self.repository.save_artifact(run.run_id, "verification", path)
-        verifier.status = AgentStatus.COMPLETED
-        await self._agent_completed(
-            run,
-            verifier,
-            f"Verifier checked {len(verification.findings)} claim(s).",
-            llm_calls=1,
-        )
-        await self.events.emit(
-            EventType.VERIFICATION_COMPLETED,
-            run.run_id,
-            f"Verifier checked {len(verification.findings)} claim(s).",
-            round_number=run.round_number,
-            agent_id=verifier.agent_id,
+            request_demo_follow_up=self.provider.name == "fake",
         )
 
-        await self._stage(run, RunStage.QUALITY_REVIEW, "QA is reviewing coverage and evidence.")
-        await self.events.emit(
-            EventType.QA_STARTED,
-            run.run_id,
-            "Quality review started.",
-            round_number=run.round_number,
-            agent_id=qa_agent.agent_id,
-        )
-        qa = await run_qa(
-            self.executor,
-            run,
-            qa_agent,
-            verification,
-            request_demo_follow_up=False,
-        )
-        if self.repository:
-            await self.repository.save_report(run.run_id, "qa", qa, round_number=run.round_number)
-        if self.artifacts:
-            path = await self.artifacts.write_json(run.run_id, "qa_report.json", qa)
+        while not qa.can_finalize and run.round_number < run.max_rounds:
+            await self.events.emit(
+                EventType.REPLAN_REQUESTED,
+                run.run_id,
+                f"QA found {len(qa.identified_gaps)} important gap(s).",
+                round_number=run.round_number,
+                agent_id=qa_agent.agent_id,
+            )
+            await self._stage(
+                run, RunStage.REPLANNING, "CEO is planning focused follow-up research."
+            )
+            run.round_number += 1
             if self.repository:
-                await self.repository.save_artifact(run.run_id, "qa", path)
-        qa_agent.status = AgentStatus.COMPLETED
-        await self._agent_completed(
-            run, qa_agent, f"QA quality score: {qa.quality_score:.0%}.", llm_calls=1
-        )
-        await self.events.emit(
-            EventType.QA_COMPLETED,
-            run.run_id,
-            f"QA quality score: {qa.quality_score:.0%}.",
-            round_number=run.round_number,
-            agent_id=qa_agent.agent_id,
-        )
+                await self.repository.save_run(run)
+            follow_up = await run_ceo_follow_up_planner(self.executor, run, ceo, qa, verification)
+            if not follow_up.needed or not follow_up.departments:
+                break
+            follow_company_plan = CompanyPlan(
+                objective="Close the QA gaps without repeating completed research.",
+                departments=follow_up.departments,
+                rationale_summary=follow_up.rationale_summary,
+            )
+            follow_decision = self.governor.validate_company_plan(follow_company_plan)
+            assert isinstance(follow_decision.plan, CompanyPlan)
+            existing_roles = {item.role_key for item in agents}
+            follow_departments = [
+                item
+                for item in follow_decision.plan.departments
+                if item.role_key not in existing_roles
+            ]
+            await self._publish_governor_decision(run, follow_decision.reductions)
+            await self.events.emit(
+                EventType.REPLAN_APPROVED,
+                run.run_id,
+                f"Governor approved research round {run.round_number} of {run.max_rounds}.",
+                round_number=run.round_number,
+                agent_id=ceo.agent_id,
+            )
+            if self.repository:
+                await self.repository.save_report(
+                    run.run_id,
+                    "follow_up_plan",
+                    follow_up,
+                    round_number=run.round_number,
+                )
+            if not follow_departments:
+                break
+            follow_reports = await self._run_departments(
+                run,
+                project_id,
+                ceo,
+                follow_departments,
+                agents,
+                evidence,
+            )
+            manager_reports.extend(follow_reports)
+            verification, qa = await self._verify_and_review(
+                run,
+                verifier,
+                qa_agent,
+                manager_reports,
+                evidence,
+                request_demo_follow_up=False,
+            )
 
         await self._stage(run, RunStage.FINAL_SYNTHESIS, "CEO is writing the final report.")
         await self.events.emit(
@@ -359,7 +305,19 @@ class HiveMindRuntime:
             agent_id=ceo.agent_id,
         )
         sources = _verified_sources(verification, evidence)
-        final_report = await run_final_synthesis(self.executor, run, ceo, verification, sources)
+        final_report = await run_final_synthesis(
+            self.executor,
+            run,
+            ceo,
+            verification,
+            qa,
+            manager_reports,
+            sources,
+        )
+        if not qa.can_finalize:
+            final_report.research_limitations.append(
+                f"QA gaps remained after the maximum of {run.max_rounds} research round(s)."
+            )
         ceo.status = AgentStatus.COMPLETED
         await self._agent_completed(run, ceo, "CEO Agent completed final synthesis.", llm_calls=1)
         await self._stage(run, RunStage.COMPLETED, "Research workflow completed.")
@@ -408,6 +366,166 @@ class HiveMindRuntime:
         # Learning note: this is stage-level recovery, not a durable workflow engine. The
         # stable run ID and agent registry are reused; later checkpoints can skip more work.
         return await self.run(run.prompt, project_id=run.project_id, existing_run=run)
+
+    async def _run_departments(
+        self,
+        run: RunRecord,
+        project_id: str,
+        ceo: AgentProfile,
+        departments: list[DepartmentSpec],
+        agents: list[AgentProfile],
+        evidence: list[Evidence],
+    ) -> list[ManagerReport]:
+        """Plan and execute only the departments approved for the current round."""
+
+        await self._stage(run, RunStage.SPAWNING_MANAGERS, "Creating approved managers.")
+        managers = [await self._manager_profile(project_id, ceo, item) for item in departments]
+        agents.extend(managers)
+        for manager in managers:
+            await self._spawn(run, manager)
+
+        await self._stage(
+            run, RunStage.MANAGERS_PLANNING, "Managers are planning teams concurrently."
+        )
+        manager_plan_results = await asyncio.gather(
+            *[
+                self._plan_manager(run, manager, department)
+                for manager, department in zip(managers, departments, strict=True)
+            ],
+            return_exceptions=True,
+        )
+        await self._stage(run, RunStage.SPAWNING_WORKERS, "Creating approved workers.")
+        teams: list[DepartmentTeam] = []
+        supporting = sum(
+            item.kind in {AgentKind.VERIFIER, AgentKind.QA, AgentKind.MEMORY_CURATOR}
+            for item in agents
+        )
+        counted_agents = len(agents) + max(0, _SUPPORTING_AGENT_RESERVE - supporting)
+        for department, manager, proposed_workers in zip(
+            departments, managers, manager_plan_results, strict=True
+        ):
+            if isinstance(proposed_workers, BaseException):
+                manager.status = AgentStatus.FAILED
+                await self._agent_failed(run, manager, str(proposed_workers))
+                teams.append(DepartmentTeam(department, manager, []))
+                continue
+            worker_decision = self.governor.validate_worker_plan(
+                proposed_workers, current_organization_agents=counted_agents
+            )
+            assert isinstance(worker_decision.plan, WorkerPlan)
+            await self._publish_governor_decision(run, worker_decision.reductions)
+            worker_profiles = []
+            for spec in worker_decision.plan.workers:
+                profile = await self._profile(
+                    project_id,
+                    role_key=spec.role_key,
+                    name=spec.name,
+                    kind=AgentKind.WORKER,
+                    objective=spec.objective,
+                    parent_agent_id=manager.agent_id,
+                    status=AgentStatus.QUEUED,
+                )
+                worker_profiles.append((spec, profile))
+            counted_agents += len(worker_profiles)
+            agents.extend(profile for _, profile in worker_profiles)
+            for _, profile in worker_profiles:
+                await self._spawn(run, profile)
+            teams.append(DepartmentTeam(department, manager, worker_profiles))
+
+        await self._stage(
+            run, RunStage.WORKERS_RESEARCHING, "Approved workers are researching concurrently."
+        )
+        department_results = await asyncio.gather(
+            *[self._execute_department(run, team, evidence) for team in teams],
+            return_exceptions=True,
+        )
+        reports = []
+        for team, result in zip(teams, department_results, strict=True):
+            if isinstance(result, BaseException):
+                await self._agent_failed(run, team.manager, str(result))
+                reports.append(_fallback_manager_report(team, str(result)))
+            else:
+                reports.append(result)
+        return reports
+
+    async def _verify_and_review(
+        self,
+        run: RunRecord,
+        verifier: AgentProfile,
+        qa_agent: AgentProfile,
+        manager_reports: list[ManagerReport],
+        evidence: list[Evidence],
+        *,
+        request_demo_follow_up: bool,
+    ) -> tuple[VerificationReport, QAReport]:
+        """Verify all accumulated claims, then independently review research quality."""
+
+        claims = [claim for report in manager_reports for claim in report.merged_claims]
+        await self._stage(run, RunStage.VERIFYING, "Verifier is checking claim references.")
+        await self.events.emit(
+            EventType.VERIFICATION_STARTED,
+            run.run_id,
+            f"Verifier is checking {len(claims)} claim(s).",
+            round_number=run.round_number,
+            agent_id=verifier.agent_id,
+        )
+        verification = await run_verifier(self.executor, run, verifier, claims, evidence)
+        if self.repository:
+            await self.repository.save_report(
+                run.run_id, "verification", verification, round_number=run.round_number
+            )
+        if self.artifacts:
+            path = await self.artifacts.write_json(run.run_id, "verification.json", verification)
+            if self.repository:
+                await self.repository.save_artifact(run.run_id, "verification", path)
+        verifier.status = AgentStatus.COMPLETED
+        await self._agent_completed(
+            run,
+            verifier,
+            f"Verifier checked {len(verification.findings)} claim(s).",
+            llm_calls=1,
+        )
+        await self.events.emit(
+            EventType.VERIFICATION_COMPLETED,
+            run.run_id,
+            f"Verifier checked {len(verification.findings)} claim(s).",
+            round_number=run.round_number,
+            agent_id=verifier.agent_id,
+        )
+
+        await self._stage(run, RunStage.QUALITY_REVIEW, "QA is reviewing coverage and evidence.")
+        await self.events.emit(
+            EventType.QA_STARTED,
+            run.run_id,
+            "Quality review started.",
+            round_number=run.round_number,
+            agent_id=qa_agent.agent_id,
+        )
+        qa = await run_qa(
+            self.executor,
+            run,
+            qa_agent,
+            verification,
+            request_demo_follow_up=request_demo_follow_up,
+        )
+        if self.repository:
+            await self.repository.save_report(run.run_id, "qa", qa, round_number=run.round_number)
+        if self.artifacts:
+            path = await self.artifacts.write_json(run.run_id, "qa_report.json", qa)
+            if self.repository:
+                await self.repository.save_artifact(run.run_id, "qa", path)
+        qa_agent.status = AgentStatus.COMPLETED
+        await self._agent_completed(
+            run, qa_agent, f"QA quality score: {qa.quality_score:.0%}.", llm_calls=1
+        )
+        await self.events.emit(
+            EventType.QA_COMPLETED,
+            run.run_id,
+            f"QA found {len(qa.identified_gaps)} gap(s); can finalize: {qa.can_finalize}.",
+            round_number=run.round_number,
+            agent_id=qa_agent.agent_id,
+        )
+        return verification, qa
 
     async def _plan_manager(
         self, run: RunRecord, manager: AgentProfile, department: DepartmentSpec

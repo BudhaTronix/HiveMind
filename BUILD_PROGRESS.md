@@ -10,7 +10,7 @@ committed and pushed before work continues.
 - [x] Add governed dynamic orchestration.
 - [x] Add SQLite persistence, status, and resume.
 - [x] Add safe web research and evidence.
-- [ ] Add verification, QA, and bounded replanning.
+- [x] Add verification, QA, and bounded replanning.
 - [ ] Add scoped, curated memory.
 - [ ] Add permissions and resilience.
 - [ ] Complete tests, evaluations, and beginner documentation.

@@ -19,6 +19,14 @@ fixed organization. Python will validate and limit your proposal.
 {COMMON_RULES}
 """.strip()
 
+CEO_FOLLOW_UP_SYSTEM = f"""
+You are HiveMind's CEO follow-up planner. Given verified findings and QA gaps, propose only
+the smallest additional departments needed to close important gaps. Do not repeat the first
+round. Python will enforce the remaining round and agent limits.
+
+{COMMON_RULES}
+""".strip()
+
 MANAGER_PLAN_SYSTEM = f"""
 You are a department manager. Propose narrowly focused workers and one to three useful
 search queries for each. Workers cannot spawn other workers or choose arbitrary tools.
