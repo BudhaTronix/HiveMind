@@ -18,7 +18,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
-from hivemind.schemas import AgentStatus, EventType, FinalReport, HiveEvent
+from hivemind.schemas import AgentStatus, EventType, FinalReport, HiveEvent, RunRecord
 
 
 @dataclass(slots=True)
@@ -165,6 +165,19 @@ class TerminalRenderer:
         body.extend(["", "Recommendations:"])
         body.extend(f"• {item}" for item in report.recommendations)
         self.console.print(Panel("\n".join(body), title=report.title, border_style="green"))
+
+    def show_saved_run(self, run: RunRecord, events: list[HiveEvent]) -> None:
+        """Reconstruct a stopped run's latest dashboard entirely from persisted events."""
+
+        self.state = DashboardState(
+            prompt=run.prompt,
+            provider=run.provider,
+            model=run.model,
+            max_rounds=run.max_rounds,
+        )
+        for event in events:
+            self.state.apply(event)
+        self.console.print(self._render_dashboard())
 
     def _render_dashboard(self) -> RenderableType:
         """Build a fresh renderable from event-derived state."""

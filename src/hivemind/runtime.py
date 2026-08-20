@@ -23,7 +23,9 @@ from hivemind.agents import (
 from hivemind.config import Settings
 from hivemind.events import EventBus
 from hivemind.governor import Governor
+from hivemind.persistence import ArtifactStore, HiveMindRepository
 from hivemind.providers.base import LLMProvider
+from hivemind.registry import AgentRegistry
 from hivemind.schemas import (
     AgentKind,
     AgentProfile,
@@ -35,14 +37,18 @@ from hivemind.schemas import (
     FinalReport,
     ManagerReport,
     QAReport,
+    RunMetrics,
     RunRecord,
     RunStage,
+    RunSummary,
+    RuntimeCheckpoint,
     SourceReference,
     VerificationReport,
     WorkerPlan,
     WorkerReport,
     WorkerSpec,
     new_id,
+    utc_now,
 )
 
 _SUPPORTING_AGENT_RESERVE = 3  # Verifier, QA, and memory curator.
@@ -89,21 +95,35 @@ class HiveMindRuntime:
         event_bus: EventBus,
         *,
         governor: Governor | None = None,
+        repository: HiveMindRepository | None = None,
+        artifacts: ArtifactStore | None = None,
+        registry: AgentRegistry | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
         self.events = event_bus
         self.governor = governor or Governor.from_settings(settings)
+        self.repository = repository
+        self.artifacts = artifacts
+        self.registry = registry or AgentRegistry(repository)
         self.executor = AgentExecutor(
             provider,
             event_bus,
             max_concurrent_calls=self.governor.limits.max_concurrent_llm_calls,
+            max_attempts=self.governor.limits.max_retries_per_task,
+            repository=repository,
         )
 
-    async def run(self, prompt: str, *, project_id: str = "demo-project") -> RuntimeResult:
+    async def run(
+        self,
+        prompt: str,
+        *,
+        project_id: str = "demo-project",
+        existing_run: RunRecord | None = None,
+    ) -> RuntimeResult:
         """Complete a governed research round and synthesize partial results safely."""
 
-        run = RunRecord(
+        run = existing_run or RunRecord(
             project_id=project_id,
             prompt=prompt,
             provider=self.provider.name,
@@ -111,6 +131,12 @@ class HiveMindRuntime:
             max_rounds=self.governor.limits.max_research_rounds,
             round_number=1,
         )
+        run.round_number = max(1, run.round_number)
+        if self.repository:
+            await self.repository.create_project(project_id, project_id)
+            await self.repository.save_run(run)
+        if self.artifacts:
+            await self.artifacts.prepare(run)
         agents: list[AgentProfile] = []
         evidence: list[Evidence] = []
         await self.events.emit(
@@ -120,7 +146,7 @@ class HiveMindRuntime:
             round_number=run.round_number,
         )
 
-        ceo = self._profile(
+        ceo = await self._profile(
             project_id,
             role_key="ceo",
             name="CEO Agent",
@@ -151,9 +177,17 @@ class HiveMindRuntime:
         assert isinstance(decision.plan, CompanyPlan)
         plan = decision.plan
         await self._publish_governor_decision(run, decision.reductions)
+        if self.repository:
+            await self.repository.save_report(
+                run.run_id, "company_plan", plan, round_number=run.round_number
+            )
+        if self.artifacts:
+            path = await self.artifacts.write_json(run.run_id, "plan.json", plan)
+            if self.repository:
+                await self.repository.save_artifact(run.run_id, "plan", path)
 
         await self._stage(run, RunStage.SPAWNING_MANAGERS, "Creating approved managers.")
-        managers = [self._manager_profile(project_id, ceo, item) for item in plan.departments]
+        managers = [await self._manager_profile(project_id, ceo, item) for item in plan.departments]
         agents.extend(managers)
         for manager in managers:
             await self._spawn(run, manager)
@@ -187,21 +221,18 @@ class HiveMindRuntime:
             )
             assert isinstance(worker_decision.plan, WorkerPlan)
             await self._publish_governor_decision(run, worker_decision.reductions)
-            worker_profiles = [
-                (
-                    spec,
-                    self._profile(
-                        project_id,
-                        role_key=spec.role_key,
-                        name=spec.name,
-                        kind=AgentKind.WORKER,
-                        objective=spec.objective,
-                        parent_agent_id=manager.agent_id,
-                        status=AgentStatus.QUEUED,
-                    ),
+            worker_profiles = []
+            for spec in worker_decision.plan.workers:
+                profile = await self._profile(
+                    project_id,
+                    role_key=spec.role_key,
+                    name=spec.name,
+                    kind=AgentKind.WORKER,
+                    objective=spec.objective,
+                    parent_agent_id=manager.agent_id,
+                    status=AgentStatus.QUEUED,
                 )
-                for spec in worker_decision.plan.workers
-            ]
+                worker_profiles.append((spec, profile))
             counted_agents += len(worker_profiles)
             agents.extend(profile for _, profile in worker_profiles)
             for _, profile in worker_profiles:
@@ -223,7 +254,7 @@ class HiveMindRuntime:
             else:
                 manager_reports.append(result)
 
-        verifier = self._profile(
+        verifier = await self._profile(
             project_id,
             role_key="verifier",
             name="Evidence Verifier",
@@ -231,7 +262,7 @@ class HiveMindRuntime:
             objective="Check claims against referenced evidence.",
             parent_agent_id=ceo.agent_id,
         )
-        qa_agent = self._profile(
+        qa_agent = await self._profile(
             project_id,
             role_key="quality-assurance",
             name="Quality Assurance Agent",
@@ -259,6 +290,14 @@ class HiveMindRuntime:
             claims,
             [item.evidence_id for item in evidence],
         )
+        if self.repository:
+            await self.repository.save_report(
+                run.run_id, "verification", verification, round_number=run.round_number
+            )
+        if self.artifacts:
+            path = await self.artifacts.write_json(run.run_id, "verification.json", verification)
+            if self.repository:
+                await self.repository.save_artifact(run.run_id, "verification", path)
         verifier.status = AgentStatus.COMPLETED
         await self._agent_completed(
             run,
@@ -289,6 +328,12 @@ class HiveMindRuntime:
             verification,
             request_demo_follow_up=False,
         )
+        if self.repository:
+            await self.repository.save_report(run.run_id, "qa", qa, round_number=run.round_number)
+        if self.artifacts:
+            path = await self.artifacts.write_json(run.run_id, "qa_report.json", qa)
+            if self.repository:
+                await self.repository.save_artifact(run.run_id, "qa", path)
         qa_agent.status = AgentStatus.COMPLETED
         await self._agent_completed(
             run, qa_agent, f"QA quality score: {qa.quality_score:.0%}.", llm_calls=1
@@ -321,7 +366,7 @@ class HiveMindRuntime:
             round_number=run.round_number,
             agent_id=ceo.agent_id,
         )
-        return RuntimeResult(
+        result = RuntimeResult(
             run=run,
             plan=plan,
             agents=agents,
@@ -331,6 +376,34 @@ class HiveMindRuntime:
             qa=qa,
             final_report=final_report,
         )
+        await self._persist_completed_run(result)
+        return result
+
+    async def resume(self, run_id: str) -> RuntimeResult:
+        """Return a completed checkpoint or restart the earliest incomplete stage."""
+
+        if not self.repository:
+            raise RuntimeError("Resume requires a configured HiveMindRepository.")
+        run = await self.repository.get_run(run_id)
+        if run is None:
+            raise ValueError(f"Run '{run_id}' was not found.")
+        await self.repository.reset_stale_tasks(run_id)
+        checkpoint_json = await self.repository.get_checkpoint(run_id, "completed")
+        if checkpoint_json:
+            checkpoint = RuntimeCheckpoint.model_validate_json(checkpoint_json)
+            return RuntimeResult(
+                run=checkpoint.run,
+                plan=checkpoint.plan,
+                agents=checkpoint.agents,
+                evidence=checkpoint.evidence,
+                manager_reports=checkpoint.manager_reports,
+                verification=checkpoint.verification,
+                qa=checkpoint.qa,
+                final_report=checkpoint.final_report,
+            )
+        # Learning note: this is stage-level recovery, not a durable workflow engine. The
+        # stable run ID and agent registry are reused; later checkpoints can skip more work.
+        return await self.run(run.prompt, project_id=run.project_id, existing_run=run)
 
     async def _plan_manager(
         self, run: RunRecord, manager: AgentProfile, department: DepartmentSpec
@@ -374,6 +447,15 @@ class HiveMindRuntime:
             reports=reports,
             failed_workers=failed,
         )
+        if self.repository:
+            await self.repository.save_report(
+                run.run_id,
+                f"manager:{manager.role_key}",
+                report,
+                round_number=run.round_number,
+                task_id=manager.agent_id,
+            )
+            await self.repository.save_claims(run.run_id, report.merged_claims)
         manager.status = AgentStatus.COMPLETED
         await self._agent_completed(
             run,
@@ -405,6 +487,9 @@ class HiveMindRuntime:
                 )
             )
             evidence.extend(worker_evidence)
+            if self.repository:
+                for item in worker_evidence:
+                    await self.repository.save_evidence(item)
         try:
             report = await run_worker(
                 self.executor,
@@ -417,6 +502,15 @@ class HiveMindRuntime:
             worker.tasks_failed += 1
             await self._agent_failed(run, worker, str(exc))
             return WorkerOutcome(report=None, error=str(exc))
+        if self.repository:
+            await self.repository.save_report(
+                run.run_id,
+                f"worker:{worker.role_key}",
+                report,
+                round_number=run.round_number,
+                task_id=worker.agent_id,
+            )
+            await self.repository.save_claims(run.run_id, report.claims)
         worker.status = AgentStatus.COMPLETED
         worker.tasks_completed += 1
         await self._agent_completed(
@@ -455,6 +549,7 @@ class HiveMindRuntime:
         )
 
     async def _spawn(self, run: RunRecord, agent: AgentProfile) -> None:
+        await self.registry.save(agent)
         await self.events.emit(
             EventType.AGENT_SPAWNED,
             run.run_id,
@@ -490,6 +585,7 @@ class HiveMindRuntime:
         }
         if learning_note:
             metadata["learning_note"] = learning_note
+        await self.registry.save(agent)
         await self.events.emit(
             EventType.AGENT_COMPLETED,
             run.run_id,
@@ -502,6 +598,7 @@ class HiveMindRuntime:
 
     async def _agent_failed(self, run: RunRecord, agent: AgentProfile, error: str) -> None:
         agent.status = AgentStatus.FAILED
+        await self.registry.save(agent)
         await self.events.emit(
             EventType.AGENT_FAILED,
             run.run_id,
@@ -514,6 +611,9 @@ class HiveMindRuntime:
 
     async def _stage(self, run: RunRecord, stage: RunStage, message: str) -> None:
         run.stage = stage
+        run.updated_at = utc_now()
+        if self.repository:
+            await self.repository.save_run(run)
         await self.events.emit(
             EventType.STAGE_CHANGED,
             run.run_id,
@@ -522,8 +622,8 @@ class HiveMindRuntime:
             metadata={"stage": stage.value},
         )
 
-    @staticmethod
-    def _profile(
+    async def _profile(
+        self,
         project_id: str,
         *,
         role_key: str,
@@ -533,7 +633,7 @@ class HiveMindRuntime:
         parent_agent_id: str | None = None,
         status: AgentStatus = AgentStatus.CREATED,
     ) -> AgentProfile:
-        return AgentProfile(
+        return await self.registry.create_or_get(
             project_id=project_id,
             role_key=role_key,
             name=name,
@@ -543,10 +643,10 @@ class HiveMindRuntime:
             status=status,
         )
 
-    def _manager_profile(
+    async def _manager_profile(
         self, project_id: str, ceo: AgentProfile, department: DepartmentSpec
     ) -> AgentProfile:
-        return self._profile(
+        return await self._profile(
             project_id,
             role_key=department.role_key,
             name=department.manager_name,
@@ -555,6 +655,76 @@ class HiveMindRuntime:
             parent_agent_id=ceo.agent_id,
             status=AgentStatus.QUEUED,
         )
+
+    async def _persist_completed_run(self, result: RuntimeResult) -> None:
+        """Save the final checkpoint and every available portable artifact."""
+
+        if self.repository:
+            await self.repository.save_run(result.run)
+            await self.repository.save_report(
+                result.run.run_id,
+                "final",
+                result.final_report,
+                round_number=result.run.round_number,
+            )
+        final_path = None
+        if self.artifacts:
+            run_id = result.run.run_id
+            evidence_path = await self.artifacts.write_json(
+                run_id, "evidence.json", result.evidence
+            )
+            final_json = await self.artifacts.write_json(
+                run_id, "final_report.json", result.final_report
+            )
+            final_path = await self.artifacts.write_final_markdown(run_id, result.final_report)
+            if self.repository:
+                await self.repository.save_artifact(run_id, "evidence", evidence_path)
+                await self.repository.save_artifact(run_id, "final_json", final_json)
+                await self.repository.save_artifact(run_id, "final_markdown", final_path)
+        metrics = RunMetrics(
+            llm_call_count=sum(
+                int(item.metadata.get("llm_calls", 0)) for item in self.events.events
+            ),
+            agent_count=len(result.agents),
+            task_count=(
+                len(await self.repository.list_tasks(result.run.run_id)) if self.repository else 0
+            ),
+            retry_count=sum(
+                item.event_type == EventType.TASK_RETRYING for item in self.events.events
+            ),
+            claim_count=sum(len(item.merged_claims) for item in result.manager_reports),
+            evidence_count=len(result.evidence),
+            verified_claim_count=sum(
+                item.status.value == "verified" for item in result.verification.findings
+            ),
+            failed_task_count=sum(
+                item.event_type == EventType.AGENT_FAILED for item in self.events.events
+            ),
+        )
+        summary = RunSummary(
+            run=result.run,
+            metrics=metrics,
+            agents=result.agents,
+            final_report_path=str(final_path) if final_path else None,
+        )
+        if self.artifacts:
+            summary_path = await self.artifacts.write_json(
+                result.run.run_id, "run_summary.json", summary
+            )
+            if self.repository:
+                await self.repository.save_artifact(result.run.run_id, "run_summary", summary_path)
+        if self.repository:
+            checkpoint = RuntimeCheckpoint(
+                run=result.run,
+                plan=result.plan,
+                agents=result.agents,
+                evidence=result.evidence,
+                manager_reports=result.manager_reports,
+                verification=result.verification,
+                qa=result.qa,
+                final_report=result.final_report,
+            )
+            await self.repository.save_checkpoint(result.run.run_id, "completed", checkpoint)
 
 
 def _fallback_manager_report(team: DepartmentTeam, error: str) -> ManagerReport:

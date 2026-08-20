@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel
 
@@ -33,10 +33,16 @@ from hivemind.schemas import (
     ManagerReport,
     QAReport,
     RunRecord,
+    TaskRecord,
+    TaskStatus,
     VerificationReport,
     WorkerPlan,
     WorkerReport,
+    utc_now,
 )
+
+if TYPE_CHECKING:
+    from hivemind.persistence import HiveMindRepository
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -50,10 +56,14 @@ class AgentExecutor:
         event_bus: EventBus,
         *,
         max_concurrent_calls: int,
+        max_attempts: int = 2,
+        repository: HiveMindRepository | None = None,
     ) -> None:
         self.provider = provider
         self.events = event_bus
         self.semaphore = asyncio.Semaphore(max_concurrent_calls)
+        self.max_attempts = max_attempts
+        self.repository = repository
 
     async def structured(
         self,
@@ -68,6 +78,40 @@ class AgentExecutor:
         """Make one validated model call while respecting global concurrency."""
 
         agent.status = status
+        title = f"Produce {schema.__name__}"
+        if self.repository:
+            cached = await self.repository.get_completed_task_output(
+                run.run_id, agent.agent_id, title
+            )
+            if cached:
+                try:
+                    result = schema.model_validate_json(cached)
+                except ValueError:
+                    # A corrupt or obsolete checkpoint is treated as missing and replaced.
+                    pass
+                else:
+                    await self.events.emit(
+                        EventType.AGENT_STATUS_CHANGED,
+                        run.run_id,
+                        f"Reused completed {schema.__name__} for {agent.name}.",
+                        round_number=run.round_number,
+                        agent_id=agent.agent_id,
+                        parent_agent_id=agent.parent_agent_id,
+                        metadata={"status": status.value, "checkpoint_reused": True},
+                    )
+                    return result
+        task = TaskRecord(
+            run_id=run.run_id,
+            agent_id=agent.agent_id,
+            title=title,
+            objective=f"Run the {agent.kind.value} role and validate {schema.__name__}.",
+            status=TaskStatus.RUNNING,
+            attempt=1,
+            max_attempts=self.max_attempts,
+            started_at=utc_now(),
+        )
+        if self.repository:
+            await self.repository.save_task(task)
         await self.events.emit(
             EventType.AGENT_STARTED,
             run.run_id,
@@ -75,17 +119,17 @@ class AgentExecutor:
             round_number=run.round_number,
             agent_id=agent.agent_id,
             parent_agent_id=agent.parent_agent_id,
+            task_id=task.task_id,
             metadata={"status": status.value},
         )
         # Learning note: a semaphore bounds requests made by this Python process. A local
         # model server may still serialize work internally depending on its own resources.
-        async with self.semaphore:
-            before = int(getattr(self.provider, "validation_failures", 0))
-            try:
+        try:
+            async with self.semaphore:
+                before = int(getattr(self.provider, "validation_failures", 0))
                 result = await self.provider.generate_structured(
                     schema, system_prompt, json.dumps(payload)
                 )
-            finally:
                 after = int(getattr(self.provider, "validation_failures", before))
                 for _ in range(max(0, after - before)):
                     await self.events.emit(
@@ -94,8 +138,20 @@ class AgentExecutor:
                         f"Invalid {schema.__name__} output; requested one repair.",
                         round_number=run.round_number,
                         agent_id=agent.agent_id,
+                        task_id=task.task_id,
                         metadata={"schema": schema.__name__},
                     )
+        except Exception as exc:
+            task.status = TaskStatus.FAILED
+            task.completed_at = utc_now()
+            task.error_message = str(exc)[:500]
+            if self.repository:
+                await self.repository.save_task(task)
+            raise
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = utc_now()
+        if self.repository:
+            await self.repository.save_task(task, result)
         return result
 
 

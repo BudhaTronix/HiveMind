@@ -8,7 +8,7 @@ committed and pushed before work continues.
 - [x] Add the live terminal dashboard.
 - [x] Add Ollama and OpenAI providers.
 - [x] Add governed dynamic orchestration.
-- [ ] Add SQLite persistence, status, and resume.
+- [x] Add SQLite persistence, status, and resume.
 - [ ] Add safe web research and evidence.
 - [ ] Add verification, QA, and bounded replanning.
 - [ ] Add scoped, curated memory.

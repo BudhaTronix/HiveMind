@@ -416,3 +416,16 @@ class RunSummary(BaseModel):
     metrics: RunMetrics
     agents: list[AgentProfile]
     final_report_path: str | None = None
+
+
+class RuntimeCheckpoint(BaseModel):
+    """A compact stage-level snapshot used by the educational resume implementation."""
+
+    run: RunRecord
+    plan: CompanyPlan
+    agents: list[AgentProfile]
+    evidence: list[Evidence]
+    manager_reports: list[ManagerReport]
+    verification: VerificationReport
+    qa: QAReport
+    final_report: FinalReport
