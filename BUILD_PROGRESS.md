@@ -9,7 +9,7 @@ committed and pushed before work continues.
 - [x] Add Ollama and OpenAI providers.
 - [x] Add governed dynamic orchestration.
 - [x] Add SQLite persistence, status, and resume.
-- [ ] Add safe web research and evidence.
+- [x] Add safe web research and evidence.
 - [ ] Add verification, QA, and bounded replanning.
 - [ ] Add scoped, curated memory.
 - [ ] Add permissions and resilience.

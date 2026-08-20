@@ -29,6 +29,7 @@ from hivemind.schemas import (
     AgentStatus,
     CompanyPlan,
     EventType,
+    Evidence,
     FinalReport,
     ManagerReport,
     QAReport,
@@ -40,6 +41,7 @@ from hivemind.schemas import (
     WorkerReport,
     utc_now,
 )
+from hivemind.security import wrap_untrusted_content
 
 if TYPE_CHECKING:
     from hivemind.persistence import HiveMindRepository
@@ -183,14 +185,18 @@ async def run_worker(
     executor: AgentExecutor,
     run: RunRecord,
     worker: AgentProfile,
-    evidence_ids: list[str],
+    evidence: list[Evidence],
 ) -> WorkerReport:
     return await executor.structured(
         run,
         worker,
         WorkerReport,
         WORKER_SYSTEM,
-        {"role_key": worker.role_key, "evidence_ids": evidence_ids},
+        {
+            "role_key": worker.role_key,
+            "evidence_ids": [item.evidence_id for item in evidence],
+            "evidence": [_evidence_for_prompt(item) for item in evidence],
+        },
     )
 
 
@@ -222,7 +228,7 @@ async def run_verifier(
     run: RunRecord,
     verifier: AgentProfile,
     claims: list[BaseModel],
-    evidence_ids: list[str],
+    evidence: list[Evidence],
 ) -> VerificationReport:
     return await executor.structured(
         run,
@@ -231,10 +237,25 @@ async def run_verifier(
         VERIFIER_SYSTEM,
         {
             "claims": [item.model_dump(mode="json") for item in claims],
-            "evidence_ids": evidence_ids,
+            "evidence_ids": [item.evidence_id for item in evidence],
+            "evidence": [_evidence_for_prompt(item) for item in evidence],
         },
         status=AgentStatus.VERIFYING,
     )
+
+
+def _evidence_for_prompt(item: Evidence) -> dict[str, object]:
+    """Expose bounded evidence while keeping external text inside trust markers."""
+
+    content = item.content_excerpt or item.snippet
+    return {
+        "evidence_id": item.evidence_id,
+        "title": item.title,
+        "url": item.url,
+        "source_type": item.source_type,
+        "retrieved_at": item.retrieved_at.isoformat(),
+        "content": wrap_untrusted_content(content, source_url=item.url),
+    }
 
 
 async def run_qa(

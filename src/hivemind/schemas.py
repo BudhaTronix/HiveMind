@@ -272,6 +272,33 @@ class Evidence(BaseModel):
     verification_status: VerificationStatus = VerificationStatus.UNVERIFIED
 
 
+class SearchResult(BaseModel):
+    """A normalized result from a search provider, not yet a fetched webpage."""
+
+    title: str
+    url: str
+    snippet: str = ""
+
+
+class FetchedPage(BaseModel):
+    """Bounded text extracted from one safely fetched public web page."""
+
+    url: str
+    title: str
+    content_type: str
+    excerpt: str
+
+
+class ToolMetadata(BaseModel):
+    """Python-owned permissions and side-effect metadata for one registered tool."""
+
+    name: str
+    description: str
+    allowed_agent_kinds: set[AgentKind]
+    side_effect: bool = False
+    requires_approval: bool = False
+
+
 class Claim(BaseModel):
     claim_id: str = Field(default_factory=lambda: new_id("claim"))
     text: str

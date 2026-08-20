@@ -50,6 +50,7 @@ from hivemind.schemas import (
     new_id,
     utc_now,
 )
+from hivemind.tools import ToolRegistry, build_default_tool_registry
 
 _SUPPORTING_AGENT_RESERVE = 3  # Verifier, QA, and memory curator.
 
@@ -98,6 +99,7 @@ class HiveMindRuntime:
         repository: HiveMindRepository | None = None,
         artifacts: ArtifactStore | None = None,
         registry: AgentRegistry | None = None,
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -106,6 +108,8 @@ class HiveMindRuntime:
         self.repository = repository
         self.artifacts = artifacts
         self.registry = registry or AgentRegistry(repository)
+        self.tools = tool_registry or build_default_tool_registry()
+        self.web_semaphore = asyncio.Semaphore(self.governor.limits.max_concurrent_web_requests)
         self.executor = AgentExecutor(
             provider,
             event_bus,
@@ -288,7 +292,7 @@ class HiveMindRuntime:
             run,
             verifier,
             claims,
-            [item.evidence_id for item in evidence],
+            evidence,
         )
         if self.repository:
             await self.repository.save_report(
@@ -490,12 +494,15 @@ class HiveMindRuntime:
             if self.repository:
                 for item in worker_evidence:
                     await self.repository.save_evidence(item)
+        elif self.settings.enable_web:
+            worker_evidence = await self._research_web(run, spec, worker, task_id)
+            evidence.extend(worker_evidence)
         try:
             report = await run_worker(
                 self.executor,
                 run,
                 worker,
-                [item.evidence_id for item in worker_evidence],
+                worker_evidence,
             )
         except Exception as exc:  # noqa: BLE001 - task isolation intentionally catches providers.
             worker.status = AgentStatus.FAILED
@@ -526,6 +533,128 @@ class HiveMindRuntime:
             ),
         )
         return WorkerOutcome(report=report)
+
+    async def _research_web(
+        self,
+        run: RunRecord,
+        spec: WorkerSpec,
+        worker: AgentProfile,
+        task_id: str,
+    ) -> list[Evidence]:
+        """Execute only the approved search queries and fetch one top result each."""
+
+        collected: list[Evidence] = []
+        for query in spec.search_queries:
+            await self.events.emit(
+                EventType.TOOL_STARTED,
+                run.run_id,
+                f"{worker.name} started web search.",
+                round_number=run.round_number,
+                task_id=task_id,
+                agent_id=worker.agent_id,
+                metadata={"tool": "web_search", "query": query},
+            )
+            try:
+                async with self.web_semaphore:
+                    results = await self.tools.execute(
+                        "web_search",
+                        agent_kind=AgentKind.WORKER,
+                        query=query,
+                        max_results=3,
+                    )
+            except Exception as exc:  # noqa: BLE001 - tool failure stays local to the worker.
+                await self._tool_failed(run, worker, task_id, "web_search", exc)
+                continue
+            await self.events.emit(
+                EventType.TOOL_COMPLETED,
+                run.run_id,
+                f"Web search returned {len(results)} result(s).",
+                round_number=run.round_number,
+                task_id=task_id,
+                agent_id=worker.agent_id,
+                metadata={"tool": "web_search", "results": len(results)},
+            )
+            query_evidence = [
+                Evidence(
+                    run_id=run.run_id,
+                    task_id=task_id,
+                    agent_id=worker.agent_id,
+                    url=result.url,
+                    title=result.title,
+                    source_type="search_result_snippet",
+                    snippet=result.snippet[:1_500],
+                    search_query=query,
+                )
+                for result in results
+            ]
+            collected.extend(query_evidence)
+            if query_evidence:
+                await self._fetch_top_result(run, worker, task_id, query_evidence[0])
+            if self.repository:
+                for item in query_evidence:
+                    await self.repository.save_evidence(item)
+        return collected
+
+    async def _fetch_top_result(
+        self,
+        run: RunRecord,
+        worker: AgentProfile,
+        task_id: str,
+        evidence: Evidence,
+    ) -> None:
+        """Enrich one search snippet with a bounded page excerpt when safe and available."""
+
+        assert evidence.url is not None
+        await self.events.emit(
+            EventType.TOOL_STARTED,
+            run.run_id,
+            f"{worker.name} started web fetch.",
+            round_number=run.round_number,
+            task_id=task_id,
+            agent_id=worker.agent_id,
+            metadata={"tool": "web_fetch", "url": evidence.url},
+        )
+        try:
+            async with self.web_semaphore:
+                page = await self.tools.execute(
+                    "web_fetch",
+                    agent_kind=AgentKind.WORKER,
+                    url=evidence.url,
+                )
+        except Exception as exc:  # noqa: BLE001 - the search snippet remains usable evidence.
+            await self._tool_failed(run, worker, task_id, "web_fetch", exc)
+            return
+        evidence.url = page.url
+        evidence.title = page.title or evidence.title
+        evidence.content_excerpt = page.excerpt
+        evidence.source_type = "web_page"
+        await self.events.emit(
+            EventType.TOOL_COMPLETED,
+            run.run_id,
+            f"Web fetch extracted {len(page.excerpt)} character(s).",
+            round_number=run.round_number,
+            task_id=task_id,
+            agent_id=worker.agent_id,
+            metadata={"tool": "web_fetch", "url": page.url},
+        )
+
+    async def _tool_failed(
+        self,
+        run: RunRecord,
+        worker: AgentProfile,
+        task_id: str,
+        tool: str,
+        error: Exception,
+    ) -> None:
+        await self.events.emit(
+            EventType.TOOL_FAILED,
+            run.run_id,
+            f"{tool} failed for {worker.name}; research will continue.",
+            round_number=run.round_number,
+            task_id=task_id,
+            agent_id=worker.agent_id,
+            metadata={"tool": tool, "error": str(error)[:300]},
+        )
 
     async def _publish_governor_decision(self, run: RunRecord, reductions: tuple[str, ...]) -> None:
         for message in reductions:
