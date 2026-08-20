@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     memory_backend: Literal["simple", "mem0"] = Field(
         default="simple", alias="HIVEMIND_MEMORY_BACKEND"
     )
+    mem0_embed_model: str = Field(default="nomic-embed-text", alias="HIVEMIND_MEM0_EMBED_MODEL")
     enable_web: bool = Field(default=True, alias="HIVEMIND_ENABLE_WEB")
 
     max_managers: int = Field(default=3, ge=1, le=10, alias="HIVEMIND_MAX_MANAGERS")

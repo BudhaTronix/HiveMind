@@ -17,6 +17,7 @@ from hivemind.agents import (
     run_final_synthesis,
     run_manager_planner,
     run_manager_synthesis,
+    run_memory_curator,
     run_qa,
     run_verifier,
     run_worker,
@@ -24,6 +25,7 @@ from hivemind.agents import (
 from hivemind.config import Settings
 from hivemind.events import EventBus
 from hivemind.governor import Governor
+from hivemind.memory import MemoryStore, create_memory_store
 from hivemind.persistence import ArtifactStore, HiveMindRepository
 from hivemind.providers.base import LLMProvider
 from hivemind.registry import AgentRegistry
@@ -32,11 +34,16 @@ from hivemind.schemas import (
     AgentProfile,
     AgentStatus,
     CompanyPlan,
+    CurationDecision,
     DepartmentSpec,
     EventType,
     Evidence,
     FinalReport,
     ManagerReport,
+    MemoryCandidate,
+    MemoryRecord,
+    MemoryScope,
+    MemoryStatus,
     QAReport,
     RunMetrics,
     RunRecord,
@@ -101,6 +108,7 @@ class HiveMindRuntime:
         artifacts: ArtifactStore | None = None,
         registry: AgentRegistry | None = None,
         tool_registry: ToolRegistry | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -110,6 +118,8 @@ class HiveMindRuntime:
         self.artifacts = artifacts
         self.registry = registry or AgentRegistry(repository)
         self.tools = tool_registry or build_default_tool_registry()
+        self.memory_store = memory_store or create_memory_store(settings, repository)
+        self.memory_candidates: list[tuple[MemoryCandidate, str]] = []
         self.web_semaphore = asyncio.Semaphore(self.governor.limits.max_concurrent_web_requests)
         self.executor = AgentExecutor(
             provider,
@@ -146,6 +156,7 @@ class HiveMindRuntime:
             await self.artifacts.prepare(run)
         agents: list[AgentProfile] = []
         evidence: list[Evidence] = []
+        self.memory_candidates = []
         await self.events.emit(
             EventType.RUN_CREATED,
             run.run_id,
@@ -171,7 +182,8 @@ class HiveMindRuntime:
             round_number=run.round_number,
             agent_id=ceo.agent_id,
         )
-        proposed_plan = await run_ceo_planner(self.executor, run, ceo)
+        ceo_memories = await self._retrieve_memories(run, ceo)
+        proposed_plan = await run_ceo_planner(self.executor, run, ceo, ceo_memories)
         await self.events.emit(
             EventType.PLAN_RECEIVED,
             run.run_id,
@@ -296,6 +308,18 @@ class HiveMindRuntime:
                 request_demo_follow_up=False,
             )
 
+        curator = await self._profile(
+            project_id,
+            role_key="memory-curator",
+            name="Memory Curator",
+            kind=AgentKind.MEMORY_CURATOR,
+            objective="Approve only concise, durable, evidence-linked memories.",
+            parent_agent_id=ceo.agent_id,
+        )
+        agents.append(curator)
+        await self._spawn(run, curator)
+        approved_memories = await self._curate_memories(run, curator, evidence)
+
         await self._stage(run, RunStage.FINAL_SYNTHESIS, "CEO is writing the final report.")
         await self.events.emit(
             EventType.FINAL_REPORT_STARTED,
@@ -313,6 +337,7 @@ class HiveMindRuntime:
             qa,
             manager_reports,
             sources,
+            approved_memories,
         )
         if not qa.can_finalize:
             final_report.research_limitations.append(
@@ -530,7 +555,8 @@ class HiveMindRuntime:
     async def _plan_manager(
         self, run: RunRecord, manager: AgentProfile, department: DepartmentSpec
     ) -> WorkerPlan:
-        return await run_manager_planner(self.executor, run, manager, department)
+        memories = await self._retrieve_memories(run, manager)
+        return await run_manager_planner(self.executor, run, manager, department, memories)
 
     async def _execute_department(
         self,
@@ -616,11 +642,13 @@ class HiveMindRuntime:
             worker_evidence = await self._research_web(run, spec, worker, task_id)
             evidence.extend(worker_evidence)
         try:
+            memories = await self._retrieve_memories(run, worker)
             report = await run_worker(
                 self.executor,
                 run,
                 worker,
                 worker_evidence,
+                memories,
             )
         except Exception as exc:  # noqa: BLE001 - task isolation intentionally catches providers.
             worker.status = AgentStatus.FAILED
@@ -636,6 +664,9 @@ class HiveMindRuntime:
                 task_id=worker.agent_id,
             )
             await self.repository.save_claims(run.run_id, report.claims)
+        self.memory_candidates.extend(
+            (candidate, worker.agent_id) for candidate in report.memory_candidates
+        )
         worker.status = AgentStatus.COMPLETED
         worker.tasks_completed += 1
         await self._agent_completed(
@@ -651,6 +682,172 @@ class HiveMindRuntime:
             ),
         )
         return WorkerOutcome(report=report)
+
+    async def _retrieve_memories(self, run: RunRecord, agent: AgentProfile) -> list[MemoryRecord]:
+        """Retrieve a few role-appropriate scopes rather than dumping all memory."""
+
+        if self.memory_store is None:
+            return []
+        scope_map = {
+            AgentKind.CEO: [
+                (MemoryScope.COMPANY, "hivemind-company"),
+                (MemoryScope.PROJECT, run.project_id),
+                (MemoryScope.USER, "local-user"),
+                (MemoryScope.RUN, run.run_id),
+            ],
+            AgentKind.MANAGER: [
+                (MemoryScope.COMPANY, "hivemind-company"),
+                (MemoryScope.PROJECT, run.project_id),
+                (MemoryScope.AGENT, agent.agent_id),
+                (MemoryScope.RUN, run.run_id),
+            ],
+            AgentKind.WORKER: [
+                (MemoryScope.PROJECT, run.project_id),
+                (MemoryScope.AGENT, agent.agent_id),
+                (MemoryScope.RUN, run.run_id),
+            ],
+        }
+        scopes = scope_map.get(agent.kind, [(MemoryScope.PROJECT, run.project_id)])
+        await self.events.emit(
+            EventType.MEMORY_SEARCH_STARTED,
+            run.run_id,
+            f"{agent.name} is searching relevant memory.",
+            round_number=run.round_number,
+            agent_id=agent.agent_id,
+        )
+        try:
+            memories = await self.memory_store.search(
+                f"{run.prompt} {agent.role_description}", scopes, limit=5
+            )
+        except Exception as exc:  # noqa: BLE001 - memory failure should not erase research.
+            await self.events.emit(
+                EventType.MEMORY_SEARCH_COMPLETED,
+                run.run_id,
+                f"Memory retrieval failed for {agent.name}; continuing without it.",
+                round_number=run.round_number,
+                agent_id=agent.agent_id,
+                metadata={"count": 0, "error": str(exc)[:300]},
+            )
+            return []
+        await self.events.emit(
+            EventType.MEMORY_SEARCH_COMPLETED,
+            run.run_id,
+            f"{agent.name} retrieved {len(memories)} relevant memory item(s).",
+            round_number=run.round_number,
+            agent_id=agent.agent_id,
+            metadata={
+                "count": len(memories),
+                "learning_note": (
+                    "Memory is retrieved database text placed into context; it does not "
+                    "change the model's weights."
+                ),
+            },
+        )
+        return memories
+
+    async def _curate_memories(
+        self,
+        run: RunRecord,
+        curator: AgentProfile,
+        evidence: list[Evidence],
+    ) -> list[MemoryRecord]:
+        """Ask the curator for decisions, then let Python perform approved writes."""
+
+        await self._stage(run, RunStage.CURATING_MEMORY, "Curating durable project memory.")
+        if self.memory_store is None or not self.memory_candidates:
+            curator.status = AgentStatus.COMPLETED
+            await self._agent_completed(
+                run, curator, "Memory curator had no durable candidates to review."
+            )
+            return []
+        existing = await self.memory_store.search(
+            run.prompt, [(MemoryScope.PROJECT, run.project_id)], limit=20
+        )
+        existing_text = {item.text.casefold().strip(): item for item in existing}
+        valid_evidence_ids = {item.evidence_id for item in evidence}
+        approved: list[MemoryRecord] = []
+        for index, (candidate, source_agent_id) in enumerate(self.memory_candidates, start=1):
+            if candidate.text.casefold().strip() in existing_text:
+                await self.events.emit(
+                    EventType.MEMORY_REJECTED,
+                    run.run_id,
+                    "Memory curator rejected a duplicate candidate.",
+                    round_number=run.round_number,
+                    agent_id=curator.agent_id,
+                    metadata={"decision": CurationDecision.REJECT.value},
+                )
+                continue
+            candidate = candidate.model_copy(
+                update={
+                    "source_evidence_ids": [
+                        item for item in candidate.source_evidence_ids if item in valid_evidence_ids
+                    ]
+                }
+            )
+            decision = await run_memory_curator(
+                self.executor,
+                run,
+                curator,
+                candidate,
+                existing,
+                candidate_number=index,
+            )
+            if decision.decision not in {
+                CurationDecision.SAVE,
+                CurationDecision.SUPERSEDES_EXISTING,
+            }:
+                await self.events.emit(
+                    EventType.MEMORY_REJECTED,
+                    run.run_id,
+                    f"Memory candidate was classified {decision.decision.value}.",
+                    round_number=run.round_number,
+                    agent_id=curator.agent_id,
+                    metadata={"decision": decision.decision.value},
+                )
+                continue
+            if (
+                decision.decision == CurationDecision.SUPERSEDES_EXISTING
+                and decision.supersedes_memory_id
+            ):
+                superseded = (
+                    await self.repository.get_memory(decision.supersedes_memory_id)
+                    if self.repository
+                    else None
+                )
+                if superseded:
+                    superseded.status = MemoryStatus.SUPERSEDED
+                    superseded.updated_at = utc_now()
+                    await self.memory_store.save(superseded)
+            record = MemoryRecord(
+                scope=MemoryScope.PROJECT,
+                scope_id=run.project_id,
+                text=candidate.text,
+                memory_type=candidate.memory_type,
+                source_agent_id=source_agent_id,
+                source_run_id=run.run_id,
+                source_evidence_ids=candidate.source_evidence_ids,
+                confidence=candidate.confidence,
+            )
+            await self.memory_store.save(record)
+            existing.append(record)
+            existing_text[record.text.casefold().strip()] = record
+            approved.append(record)
+            await self.events.emit(
+                EventType.MEMORY_SAVED,
+                run.run_id,
+                "Memory curator approved a durable project memory.",
+                round_number=run.round_number,
+                agent_id=curator.agent_id,
+                metadata={"memory_id": record.memory_id, "scope": record.scope.value},
+            )
+        curator.status = AgentStatus.COMPLETED
+        await self._agent_completed(
+            run,
+            curator,
+            f"Memory curator approved {len(approved)} item(s).",
+            llm_calls=len(self.memory_candidates),
+        )
+        return approved
 
     async def _research_web(
         self,

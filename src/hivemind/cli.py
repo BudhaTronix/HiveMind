@@ -21,10 +21,12 @@ from rich.table import Table
 
 from hivemind.config import Settings, load_settings
 from hivemind.events import EventBus
+from hivemind.memory import SimpleSQLiteMemoryStore
 from hivemind.persistence import ArtifactStore, HiveMindRepository, JsonlEventSink
 from hivemind.providers import create_provider
 from hivemind.providers.base import ProviderError
 from hivemind.runtime import HiveMindRuntime, RuntimeResult
+from hivemind.schemas import MemoryScope
 from hivemind.terminal_ui import TerminalRenderer
 
 app = typer.Typer(
@@ -34,8 +36,10 @@ app = typer.Typer(
 )
 runs_app = typer.Typer(help="Inspect saved research runs.", no_args_is_help=True)
 agents_app = typer.Typer(help="Inspect stable project agent profiles.", no_args_is_help=True)
+memories_app = typer.Typer(help="Inspect curated durable memories.", no_args_is_help=True)
 app.add_typer(runs_app, name="runs")
 app.add_typer(agents_app, name="agents")
+app.add_typer(memories_app, name="memories")
 console = Console()
 
 
@@ -167,6 +171,25 @@ def show_agent(agent_id: str = typer.Argument(...)) -> None:
     """Show one agent profile."""
 
     _run_async(_show_agent(agent_id), debug=False)
+
+
+@memories_app.command("list")
+def list_memories(
+    project: str = typer.Option(..., "--project", help="Project memory scope."),
+) -> None:
+    """List active memories approved for one project."""
+
+    _run_async(_list_memories(project), debug=False)
+
+
+@memories_app.command("search")
+def search_memories(
+    query: str = typer.Argument(..., help="Keywords to retrieve."),
+    project: str = typer.Option(..., "--project", help="Project memory scope."),
+) -> None:
+    """Search project memory using the default transparent ranking."""
+
+    _run_async(_search_memories(query, project), debug=False)
 
 
 @app.command()
@@ -332,6 +355,35 @@ async def _show_agent(agent_id: str) -> None:
     if agent is None:
         raise ValueError(f"Agent '{agent_id}' was not found.")
     console.print_json(agent.model_dump_json(indent=2))
+
+
+async def _list_memories(project: str) -> None:
+    repository = HiveMindRepository(load_settings().db_path)
+    memories = await repository.list_memories([(MemoryScope.PROJECT, project)])
+    _print_memories(memories, title=f"Project memories: {project}")
+
+
+async def _search_memories(query: str, project: str) -> None:
+    repository = HiveMindRepository(load_settings().db_path)
+    memories = await SimpleSQLiteMemoryStore(repository).search(
+        query, [(MemoryScope.PROJECT, project)], limit=10
+    )
+    _print_memories(memories, title=f"Memory search: {query}")
+
+
+def _print_memories(memories: list[Any], *, title: str) -> None:
+    table = Table(title=title)
+    for heading in ("Memory ID", "Type", "Confidence", "Text", "Updated"):
+        table.add_column(heading)
+    for memory in memories:
+        table.add_row(
+            memory.memory_id,
+            memory.memory_type.value,
+            f"{memory.confidence:.0%}",
+            memory.text,
+            memory.updated_at.astimezone().strftime("%Y-%m-%d"),
+        )
+    console.print(table)
 
 
 async def _doctor_checks(settings: Settings) -> list[DoctorCheck]:

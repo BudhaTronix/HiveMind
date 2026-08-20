@@ -11,6 +11,6 @@ committed and pushed before work continues.
 - [x] Add SQLite persistence, status, and resume.
 - [x] Add safe web research and evidence.
 - [x] Add verification, QA, and bounded replanning.
-- [ ] Add scoped, curated memory.
+- [x] Add scoped, curated memory.
 - [ ] Add permissions and resilience.
 - [ ] Complete tests, evaluations, and beginner documentation.

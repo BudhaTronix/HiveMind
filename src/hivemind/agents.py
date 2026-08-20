@@ -20,6 +20,7 @@ from hivemind.prompts import (
     FINAL_SYSTEM,
     MANAGER_PLAN_SYSTEM,
     MANAGER_SYNTHESIS_SYSTEM,
+    MEMORY_CURATOR_SYSTEM,
     QA_SYSTEM,
     VERIFIER_SYSTEM,
     WORKER_SYSTEM,
@@ -29,11 +30,14 @@ from hivemind.schemas import (
     AgentProfile,
     AgentStatus,
     CompanyPlan,
+    CurationResult,
     EventType,
     Evidence,
     FinalReport,
     FollowUpPlan,
     ManagerReport,
+    MemoryCandidate,
+    MemoryRecord,
     QAReport,
     RunRecord,
     TaskRecord,
@@ -78,11 +82,14 @@ class AgentExecutor:
         payload: dict[str, object],
         *,
         status: AgentStatus = AgentStatus.RUNNING,
+        task_label: str | None = None,
     ) -> SchemaT:
         """Make one validated model call while respecting global concurrency."""
 
         agent.status = status
         title = f"Round {run.round_number}: Produce {schema.__name__}"
+        if task_label:
+            title += f" ({task_label})"
         if self.repository:
             cached = await self.repository.get_completed_task_output(
                 run.run_id, agent.agent_id, title
@@ -160,10 +167,18 @@ class AgentExecutor:
 
 
 async def run_ceo_planner(
-    executor: AgentExecutor, run: RunRecord, ceo: AgentProfile
+    executor: AgentExecutor,
+    run: RunRecord,
+    ceo: AgentProfile,
+    memories: list[MemoryRecord] | None = None,
 ) -> CompanyPlan:
     return await executor.structured(
-        run, ceo, CompanyPlan, CEO_PLAN_SYSTEM, {"prompt": run.prompt}, status=AgentStatus.PLANNING
+        run,
+        ceo,
+        CompanyPlan,
+        CEO_PLAN_SYSTEM,
+        {"prompt": run.prompt, "memories": _memory_text(memories or [])},
+        status=AgentStatus.PLANNING,
     )
 
 
@@ -197,13 +212,17 @@ async def run_manager_planner(
     run: RunRecord,
     manager: AgentProfile,
     department: BaseModel,
+    memories: list[MemoryRecord] | None = None,
 ) -> WorkerPlan:
     return await executor.structured(
         run,
         manager,
         WorkerPlan,
         MANAGER_PLAN_SYSTEM,
-        department.model_dump(mode="json"),
+        {
+            **department.model_dump(mode="json"),
+            "memories": _memory_text(memories or []),
+        },
         status=AgentStatus.PLANNING,
     )
 
@@ -213,6 +232,7 @@ async def run_worker(
     run: RunRecord,
     worker: AgentProfile,
     evidence: list[Evidence],
+    memories: list[MemoryRecord] | None = None,
 ) -> WorkerReport:
     return await executor.structured(
         run,
@@ -223,6 +243,7 @@ async def run_worker(
             "role_key": worker.role_key,
             "evidence_ids": [item.evidence_id for item in evidence],
             "evidence": [_evidence_for_prompt(item) for item in evidence],
+            "memories": _memory_text(memories or []),
         },
     )
 
@@ -316,6 +337,7 @@ async def run_final_synthesis(
     qa: QAReport,
     manager_reports: list[ManagerReport],
     sources: list[BaseModel],
+    approved_memories: list[MemoryRecord] | None = None,
 ) -> FinalReport:
     return await executor.structured(
         run,
@@ -330,6 +352,45 @@ async def run_final_synthesis(
             "qa": qa.model_dump(mode="json"),
             "manager_reports": [item.model_dump(mode="json") for item in manager_reports],
             "sources": [item.model_dump(mode="json") for item in sources],
+            "approved_memories": _memory_text(approved_memories or []),
         },
         status=AgentStatus.SYNTHESIZING,
     )
+
+
+async def run_memory_curator(
+    executor: AgentExecutor,
+    run: RunRecord,
+    curator: AgentProfile,
+    candidate: MemoryCandidate,
+    existing_memories: list[MemoryRecord],
+    *,
+    candidate_number: int,
+) -> CurationResult:
+    """Classify one candidate without granting the model direct write access."""
+
+    return await executor.structured(
+        run,
+        curator,
+        CurationResult,
+        MEMORY_CURATOR_SYSTEM,
+        {
+            "candidate": candidate.model_dump(mode="json"),
+            "existing_memories": _memory_text(existing_memories),
+        },
+        task_label=f"candidate-{candidate_number}",
+    )
+
+
+def _memory_text(memories: list[MemoryRecord]) -> list[dict[str, object]]:
+    """Provide only concise public memory fields, never the entire database."""
+
+    return [
+        {
+            "memory_id": item.memory_id,
+            "text": item.text,
+            "memory_type": item.memory_type.value,
+            "confidence": item.confidence,
+        }
+        for item in memories
+    ]

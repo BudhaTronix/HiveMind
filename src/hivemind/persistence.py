@@ -20,6 +20,9 @@ from hivemind.schemas import (
     Evidence,
     FinalReport,
     HiveEvent,
+    MemoryRecord,
+    MemoryScope,
+    MemoryStatus,
     RunRecord,
     TaskRecord,
     TaskStatus,
@@ -36,6 +39,7 @@ class HiveMindRepository:
         self.path = path
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self.fts_available = False
 
     async def initialize(self) -> None:
         """Create the versioned schema on first use."""
@@ -49,6 +53,18 @@ class HiveMindRepository:
             async with aiosqlite.connect(self.path) as db:
                 await db.execute("PRAGMA journal_mode = WAL")
                 await db.executescript(_SCHEMA)
+                try:
+                    await db.execute(
+                        """
+                        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+                        USING fts5(memory_id UNINDEXED, text)
+                        """
+                    )
+                except aiosqlite.OperationalError:
+                    # Some SQLite builds omit FTS5. Keyword scoring still works in Python.
+                    self.fts_available = False
+                else:
+                    self.fts_available = True
                 await db.execute(
                     "INSERT OR IGNORE INTO schema_version(version) VALUES (?)",
                     (SCHEMA_VERSION,),
@@ -377,6 +393,101 @@ class HiveMindRepository:
             )
             await db.commit()
 
+    async def save_memory(self, memory: MemoryRecord) -> None:
+        """Persist durable memory and update the optional full-text index."""
+
+        await self.initialize()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO memories(
+                    memory_id, scope, scope_id, status, updated_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = excluded.updated_at,
+                    payload_json = excluded.payload_json
+                """,
+                (
+                    memory.memory_id,
+                    memory.scope.value,
+                    memory.scope_id,
+                    memory.status.value,
+                    memory.updated_at.isoformat(),
+                    memory.model_dump_json(),
+                ),
+            )
+            if self.fts_available:
+                await db.execute(
+                    "DELETE FROM memories_fts WHERE memory_id = ?", (memory.memory_id,)
+                )
+                await db.execute(
+                    "INSERT INTO memories_fts(memory_id, text) VALUES (?, ?)",
+                    (memory.memory_id, memory.text),
+                )
+            await db.commit()
+
+    async def get_memory(self, memory_id: str) -> MemoryRecord | None:
+        row = await self._fetchone(
+            "SELECT payload_json FROM memories WHERE memory_id = ?", (memory_id,)
+        )
+        return MemoryRecord.model_validate_json(row[0]) if row else None
+
+    async def list_memories(
+        self,
+        scopes: list[tuple[MemoryScope, str]] | None = None,
+        *,
+        status: MemoryStatus = MemoryStatus.ACTIVE,
+        limit: int = 200,
+    ) -> list[MemoryRecord]:
+        sql = "SELECT payload_json FROM memories WHERE status = ?"
+        params: list[object] = [status.value]
+        if scopes:
+            clauses = []
+            for scope, scope_id in scopes:
+                clauses.append("(scope = ? AND scope_id = ?)")
+                params.extend([scope.value, scope_id])
+            sql += " AND (" + " OR ".join(clauses) + ")"
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        rows = await self._fetchall(sql, tuple(params))
+        return [MemoryRecord.model_validate_json(row[0]) for row in rows]
+
+    async def search_memory_text(
+        self,
+        query: str,
+        scopes: list[tuple[MemoryScope, str]],
+        *,
+        limit: int = 50,
+    ) -> list[MemoryRecord]:
+        """Use FTS5 when available and fall back to scoped recent memories."""
+
+        await self.initialize()
+        keywords = [item for item in _keywords(query) if len(item) > 1]
+        if not self.fts_available or not keywords:
+            return await self.list_memories(scopes, limit=limit)
+        clauses = []
+        params: list[object] = [" OR ".join(f'"{item}"*' for item in keywords)]
+        for scope, scope_id in scopes:
+            clauses.append("(m.scope = ? AND m.scope_id = ?)")
+            params.extend([scope.value, scope_id])
+        params.extend([MemoryStatus.ACTIVE.value, limit])
+        sql = f"""
+            SELECT m.payload_json
+            FROM memories_fts f
+            JOIN memories m ON m.memory_id = f.memory_id
+            WHERE memories_fts MATCH ?
+              AND ({" OR ".join(clauses)})
+              AND m.status = ?
+            ORDER BY bm25(memories_fts), m.updated_at DESC
+            LIMIT ?
+        """
+        try:
+            rows = await self._fetchall(sql, tuple(params))
+        except aiosqlite.OperationalError:
+            return await self.list_memories(scopes, limit=limit)
+        return [MemoryRecord.model_validate_json(row[0]) for row in rows]
+
     async def _fetchone(self, sql: str, params: tuple[object, ...] = ()) -> Any:
         await self.initialize()
         async with aiosqlite.connect(self.path) as db:
@@ -587,3 +698,12 @@ CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id);
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, scope_id, status);
 """
+
+
+def _keywords(text: str) -> list[str]:
+    """Return lowercase alphanumeric terms safe to place in an FTS query."""
+
+    return [
+        "".join(character for character in word.lower() if character.isalnum())
+        for word in text.split()
+    ]
