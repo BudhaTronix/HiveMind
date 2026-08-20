@@ -7,6 +7,7 @@ not create the same departments. It is a simulator, not a source of real-world f
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, TypeVar
 
@@ -43,8 +44,9 @@ class FakeLLMProvider:
     name = "fake"
     model = "educational-simulator"
 
-    def __init__(self, *, fail_roles: set[str] | None = None) -> None:
+    def __init__(self, *, fail_roles: set[str] | None = None, delay_seconds: float = 0) -> None:
         self.fail_roles = fail_roles or set()
+        self.delay_seconds = delay_seconds
         self.call_count = 0
         self.active_calls = 0
         self.max_active_calls = 0
@@ -65,25 +67,32 @@ class FakeLLMProvider:
         user_prompt: str,
     ) -> SchemaT:
         self.call_count += 1
-        payload = _payload(user_prompt)
-        role_key = str(payload.get("role_key", ""))
-        if role_key in self.fail_roles:
-            raise RuntimeError(f"Simulated failure for {role_key}")
-        factory = {
-            CompanyPlan: self._company_plan,
-            WorkerPlan: self._worker_plan,
-            WorkerReport: self._worker_report,
-            ManagerReport: self._manager_report,
-            VerificationReport: self._verification_report,
-            QAReport: self._qa_report,
-            FollowUpPlan: self._follow_up_plan,
-            CurationResult: self._curation_result,
-            FinalReport: self._final_report,
-        }.get(schema)
-        if factory is None:
-            raise TypeError(f"Fake provider has no fixture for {schema.__name__}")
-        result = factory(payload)
-        return schema.model_validate(result)
+        self.active_calls += 1
+        self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            if self.delay_seconds:
+                await asyncio.sleep(self.delay_seconds)
+            payload = _payload(user_prompt)
+            role_key = str(payload.get("role_key", ""))
+            if role_key in self.fail_roles:
+                raise RuntimeError(f"Simulated failure for {role_key}")
+            factory = {
+                CompanyPlan: self._company_plan,
+                WorkerPlan: self._worker_plan,
+                WorkerReport: self._worker_report,
+                ManagerReport: self._manager_report,
+                VerificationReport: self._verification_report,
+                QAReport: self._qa_report,
+                FollowUpPlan: self._follow_up_plan,
+                CurationResult: self._curation_result,
+                FinalReport: self._final_report,
+            }.get(schema)
+            if factory is None:
+                raise TypeError(f"Fake provider has no fixture for {schema.__name__}")
+            result = factory(payload)
+            return schema.model_validate(result)
+        finally:
+            self.active_calls -= 1
 
     def _company_plan(self, data: dict[str, Any]) -> CompanyPlan:
         prompt = str(data.get("prompt", "research topic"))

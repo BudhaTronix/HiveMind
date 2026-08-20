@@ -7,7 +7,7 @@ committed and pushed before work continues.
 - [x] Create the installable project and offline demo.
 - [x] Add the live terminal dashboard.
 - [x] Add Ollama and OpenAI providers.
-- [ ] Add governed dynamic orchestration.
+- [x] Add governed dynamic orchestration.
 - [ ] Add SQLite persistence, status, and resume.
 - [ ] Add safe web research and evidence.
 - [ ] Add verification, QA, and bounded replanning.

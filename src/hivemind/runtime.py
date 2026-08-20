@@ -1,35 +1,35 @@
-"""Coordinate the educational multi-agent workflow in one Python process.
+"""Coordinate the governed multi-agent workflow in one Python process.
 
-This first runtime already demonstrates the core meaning of an agent: a role, identity,
-status, prompt, model call, and result. Later subsystems add persistence and web tools, but
-Python—not the model—always decides what is created and executed.
+The runtime turns validated model proposals into scheduled work. Manager planning and
+independent worker research can overlap, but a shared semaphore limits model calls. Results
+are gathered individually so one failed worker does not discard successful siblings.
 """
 
 from __future__ import annotations
 
-import json
+import asyncio
 from dataclasses import dataclass
-from typing import TypeVar
 
-from pydantic import BaseModel
-
+from hivemind.agents import (
+    AgentExecutor,
+    run_ceo_planner,
+    run_final_synthesis,
+    run_manager_planner,
+    run_manager_synthesis,
+    run_qa,
+    run_verifier,
+    run_worker,
+)
 from hivemind.config import Settings
 from hivemind.events import EventBus
-from hivemind.prompts import (
-    CEO_PLAN_SYSTEM,
-    FINAL_SYSTEM,
-    MANAGER_PLAN_SYSTEM,
-    MANAGER_SYNTHESIS_SYSTEM,
-    QA_SYSTEM,
-    VERIFIER_SYSTEM,
-    WORKER_SYSTEM,
-)
+from hivemind.governor import Governor
 from hivemind.providers.base import LLMProvider
 from hivemind.schemas import (
     AgentKind,
     AgentProfile,
     AgentStatus,
     CompanyPlan,
+    DepartmentSpec,
     EventType,
     Evidence,
     FinalReport,
@@ -41,10 +41,11 @@ from hivemind.schemas import (
     VerificationReport,
     WorkerPlan,
     WorkerReport,
+    WorkerSpec,
     new_id,
 )
 
-SchemaT = TypeVar("SchemaT", bound=BaseModel)
+_SUPPORTING_AGENT_RESERVE = 3  # Verifier, QA, and memory curator.
 
 
 @dataclass(slots=True)
@@ -61,41 +62,70 @@ class RuntimeResult:
     final_report: FinalReport
 
 
+@dataclass(slots=True)
+class DepartmentTeam:
+    """One approved manager and the workers Python actually created for it."""
+
+    department: DepartmentSpec
+    manager: AgentProfile
+    workers: list[tuple[WorkerSpec, AgentProfile]]
+
+
+@dataclass(slots=True)
+class WorkerOutcome:
+    """Represent worker success or failure without raising through sibling tasks."""
+
+    report: WorkerReport | None
+    error: str | None = None
+
+
 class HiveMindRuntime:
     """Run a transparent CEO → manager → worker research workflow."""
 
-    def __init__(self, settings: Settings, provider: LLMProvider, event_bus: EventBus) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        provider: LLMProvider,
+        event_bus: EventBus,
+        *,
+        governor: Governor | None = None,
+    ) -> None:
         self.settings = settings
         self.provider = provider
         self.events = event_bus
+        self.governor = governor or Governor.from_settings(settings)
+        self.executor = AgentExecutor(
+            provider,
+            event_bus,
+            max_concurrent_calls=self.governor.limits.max_concurrent_llm_calls,
+        )
 
     async def run(self, prompt: str, *, project_id: str = "demo-project") -> RuntimeResult:
-        """Complete an offline-capable first-round workflow."""
+        """Complete a governed research round and synthesize partial results safely."""
 
         run = RunRecord(
             project_id=project_id,
             prompt=prompt,
             provider=self.provider.name,
             model=self.provider.model,
-            max_rounds=self.settings.max_research_rounds,
+            max_rounds=self.governor.limits.max_research_rounds,
+            round_number=1,
         )
         agents: list[AgentProfile] = []
         evidence: list[Evidence] = []
-        manager_reports: list[ManagerReport] = []
-        run.round_number = 1
-
         await self.events.emit(
             EventType.RUN_CREATED,
             run.run_id,
             f"Created run {run.run_id}.",
             round_number=run.round_number,
         )
-        ceo = AgentProfile(
-            project_id=project_id,
+
+        ceo = self._profile(
+            project_id,
             role_key="ceo",
             name="CEO Agent",
             kind=AgentKind.CEO,
-            role_description="Plans the organization and synthesizes the final report.",
+            objective="Plan the organization and synthesize the final report.",
             status=AgentStatus.PLANNING,
         )
         agents.append(ceo)
@@ -105,213 +135,190 @@ class HiveMindRuntime:
             EventType.PLAN_REQUESTED,
             run.run_id,
             "CEO is proposing prompt-specific departments.",
+            round_number=run.round_number,
             agent_id=ceo.agent_id,
         )
-        plan = await self._generate(
-            run, CompanyPlan, CEO_PLAN_SYSTEM, json.dumps({"prompt": prompt})
-        )
-        # Learning note: a model response is only a proposal. Slicing here is a first visible
-        # guardrail; the dedicated Governor later owns all related limits.
-        plan = plan.model_copy(
-            update={"departments": plan.departments[: self.settings.max_managers]}
-        )
+        proposed_plan = await run_ceo_planner(self.executor, run, ceo)
         await self.events.emit(
             EventType.PLAN_RECEIVED,
             run.run_id,
-            f"CEO requested {len(plan.departments)} departments.",
+            f"CEO requested {len(proposed_plan.departments)} departments.",
+            round_number=run.round_number,
             agent_id=ceo.agent_id,
         )
-        await self.events.emit(
-            EventType.PLAN_VALIDATED,
-            run.run_id,
-            f"Runtime approved {len(plan.departments)} departments.",
-            agent_id=ceo.agent_id,
-            metadata={
-                "learning_note": (
-                    "The CEO returned data; Python is now creating the approved agents."
-                )
-            },
+        await self._stage(run, RunStage.VALIDATING_PLAN, "Governor is validating the CEO plan.")
+        decision = self.governor.validate_company_plan(proposed_plan)
+        assert isinstance(decision.plan, CompanyPlan)
+        plan = decision.plan
+        await self._publish_governor_decision(run, decision.reductions)
+
+        await self._stage(run, RunStage.SPAWNING_MANAGERS, "Creating approved managers.")
+        managers = [self._manager_profile(project_id, ceo, item) for item in plan.departments]
+        agents.extend(managers)
+        for manager in managers:
+            await self._spawn(run, manager)
+
+        await self._stage(
+            run, RunStage.MANAGERS_PLANNING, "Managers are planning teams concurrently."
+        )
+        manager_plan_results = await asyncio.gather(
+            *[
+                self._plan_manager(run, manager, department)
+                for manager, department in zip(managers, plan.departments, strict=True)
+            ],
+            return_exceptions=True,
         )
 
-        for department in plan.departments:
-            manager = AgentProfile(
-                project_id=project_id,
-                role_key=department.role_key,
-                name=department.manager_name,
-                kind=AgentKind.MANAGER,
-                role_description=department.objective,
-                parent_agent_id=ceo.agent_id,
-                status=AgentStatus.PLANNING,
+        await self._stage(run, RunStage.SPAWNING_WORKERS, "Creating approved workers.")
+        teams: list[DepartmentTeam] = []
+        # Reserve supporting agents up front so the final organization never exceeds the
+        # configured total when verifier, QA, and memory curator are added.
+        counted_agents = 1 + len(managers) + _SUPPORTING_AGENT_RESERVE
+        for department, manager, proposed_workers in zip(
+            plan.departments, managers, manager_plan_results, strict=True
+        ):
+            if isinstance(proposed_workers, BaseException):
+                manager.status = AgentStatus.FAILED
+                await self._agent_failed(run, manager, str(proposed_workers))
+                teams.append(DepartmentTeam(department, manager, []))
+                continue
+            worker_decision = self.governor.validate_worker_plan(
+                proposed_workers, current_organization_agents=counted_agents
             )
-            agents.append(manager)
-            await self._spawn(run, manager)
-            worker_plan = await self._generate(
-                run,
-                WorkerPlan,
-                MANAGER_PLAN_SYSTEM,
-                department.model_dump_json(),
-            )
-            reports: list[WorkerReport] = []
-            for worker_spec in worker_plan.workers[: self.settings.max_workers_per_manager]:
-                worker = AgentProfile(
-                    project_id=project_id,
-                    role_key=worker_spec.role_key,
-                    name=worker_spec.name,
-                    kind=AgentKind.WORKER,
-                    role_description=worker_spec.objective,
-                    parent_agent_id=manager.agent_id,
-                    status=AgentStatus.RUNNING,
+            assert isinstance(worker_decision.plan, WorkerPlan)
+            await self._publish_governor_decision(run, worker_decision.reductions)
+            worker_profiles = [
+                (
+                    spec,
+                    self._profile(
+                        project_id,
+                        role_key=spec.role_key,
+                        name=spec.name,
+                        kind=AgentKind.WORKER,
+                        objective=spec.objective,
+                        parent_agent_id=manager.agent_id,
+                        status=AgentStatus.QUEUED,
+                    ),
                 )
-                agents.append(worker)
-                await self._spawn(run, worker)
-                task_id = new_id("task")
-                item = Evidence(
-                    run_id=run.run_id,
-                    task_id=task_id,
-                    agent_id=worker.agent_id,
-                    title=f"Simulated offline evidence for {worker_spec.name}",
-                    source_type="demo_simulation",
-                    snippet="Synthetic evidence used only to exercise the workflow.",
-                    search_query=worker_spec.search_queries[0]
-                    if worker_spec.search_queries
-                    else None,
-                )
-                evidence.append(item)
-                report = await self._generate(
-                    run,
-                    WorkerReport,
-                    WORKER_SYSTEM,
-                    json.dumps({"role_key": worker.role_key, "evidence_ids": [item.evidence_id]}),
-                )
-                reports.append(report)
-                worker.status = AgentStatus.COMPLETED
-                await self.events.emit(
-                    EventType.AGENT_COMPLETED,
-                    run.run_id,
-                    f"{worker.name} completed with {len(report.claims)} claim(s).",
-                    agent_id=worker.agent_id,
-                    parent_agent_id=manager.agent_id,
-                    round_number=run.round_number,
-                    metadata={
-                        "status": worker.status.value,
-                        "claims": len(report.claims),
-                        "evidence": 1,
-                        "claims_added": len(report.claims),
-                        "evidence_added": 1,
-                        "llm_calls": 1,
-                        "learning_note": (
-                            "Demo evidence is labelled synthetic; real web content is treated "
-                            "as untrusted data and never as instructions."
-                        ),
-                    },
-                )
-            manager.status = AgentStatus.SYNTHESIZING
-            manager_report = await self._generate(
-                run,
-                ManagerReport,
-                MANAGER_SYNTHESIS_SYSTEM,
-                json.dumps(
-                    {
-                        "name": department.name,
-                        "worker_reports": [item.model_dump(mode="json") for item in reports],
-                        "failed_workers": 0,
-                    }
-                ),
-            )
-            manager_reports.append(manager_report)
-            manager.status = AgentStatus.COMPLETED
-            await self.events.emit(
-                EventType.AGENT_COMPLETED,
-                run.run_id,
-                f"{manager.name} synthesized {len(reports)} worker report(s).",
-                agent_id=manager.agent_id,
-                parent_agent_id=ceo.agent_id,
-                round_number=run.round_number,
-                metadata={"status": manager.status.value, "llm_calls": 1},
-            )
+                for spec in worker_decision.plan.workers
+            ]
+            counted_agents += len(worker_profiles)
+            agents.extend(profile for _, profile in worker_profiles)
+            for _, profile in worker_profiles:
+                await self._spawn(run, profile)
+            teams.append(DepartmentTeam(department, manager, worker_profiles))
+
+        await self._stage(
+            run, RunStage.WORKERS_RESEARCHING, "Approved workers are researching concurrently."
+        )
+        department_results = await asyncio.gather(
+            *[self._execute_department(run, team, evidence) for team in teams],
+            return_exceptions=True,
+        )
+        manager_reports: list[ManagerReport] = []
+        for team, result in zip(teams, department_results, strict=True):
+            if isinstance(result, BaseException):
+                await self._agent_failed(run, team.manager, str(result))
+                manager_reports.append(_fallback_manager_report(team, str(result)))
+            else:
+                manager_reports.append(result)
+
+        verifier = self._profile(
+            project_id,
+            role_key="verifier",
+            name="Evidence Verifier",
+            kind=AgentKind.VERIFIER,
+            objective="Check claims against referenced evidence.",
+            parent_agent_id=ceo.agent_id,
+        )
+        qa_agent = self._profile(
+            project_id,
+            role_key="quality-assurance",
+            name="Quality Assurance Agent",
+            kind=AgentKind.QA,
+            objective="Review coverage, contradictions, and evidence quality.",
+            parent_agent_id=ceo.agent_id,
+        )
+        agents.extend([verifier, qa_agent])
+        await self._spawn(run, verifier)
+        await self._spawn(run, qa_agent)
 
         claims = [claim for report in manager_reports for claim in report.merged_claims]
         await self._stage(run, RunStage.VERIFYING, "Verifier is checking claim references.")
-        verification = await self._generate(
+        await self.events.emit(
+            EventType.VERIFICATION_STARTED,
+            run.run_id,
+            f"Verifier is checking {len(claims)} claim(s).",
+            round_number=run.round_number,
+            agent_id=verifier.agent_id,
+        )
+        verification = await run_verifier(
+            self.executor,
             run,
-            VerificationReport,
-            VERIFIER_SYSTEM,
-            json.dumps(
-                {
-                    "claims": [item.model_dump(mode="json") for item in claims],
-                    "evidence_ids": [item.evidence_id for item in evidence],
-                }
-            ),
+            verifier,
+            claims,
+            [item.evidence_id for item in evidence],
+        )
+        verifier.status = AgentStatus.COMPLETED
+        await self._agent_completed(
+            run,
+            verifier,
+            f"Verifier checked {len(verification.findings)} claim(s).",
+            llm_calls=1,
         )
         await self.events.emit(
             EventType.VERIFICATION_COMPLETED,
             run.run_id,
             f"Verifier checked {len(verification.findings)} claim(s).",
+            round_number=run.round_number,
+            agent_id=verifier.agent_id,
         )
+
         await self._stage(run, RunStage.QUALITY_REVIEW, "QA is reviewing coverage and evidence.")
-        qa = await self._generate(
+        await self.events.emit(
+            EventType.QA_STARTED,
+            run.run_id,
+            "Quality review started.",
+            round_number=run.round_number,
+            agent_id=qa_agent.agent_id,
+        )
+        qa = await run_qa(
+            self.executor,
             run,
-            QAReport,
-            QA_SYSTEM,
-            json.dumps(
-                {
-                    "round_number": 1,
-                    "request_demo_follow_up": False,
-                    "verification_findings": [
-                        item.model_dump(mode="json") for item in verification.findings
-                    ],
-                }
-            ),
+            qa_agent,
+            verification,
+            request_demo_follow_up=False,
+        )
+        qa_agent.status = AgentStatus.COMPLETED
+        await self._agent_completed(
+            run, qa_agent, f"QA quality score: {qa.quality_score:.0%}.", llm_calls=1
         )
         await self.events.emit(
             EventType.QA_COMPLETED,
             run.run_id,
             f"QA quality score: {qa.quality_score:.0%}.",
+            round_number=run.round_number,
+            agent_id=qa_agent.agent_id,
         )
+
         await self._stage(run, RunStage.FINAL_SYNTHESIS, "CEO is writing the final report.")
-        evidence_by_id = {item.evidence_id: item for item in evidence}
-        sources = []
-        for finding in verification.findings:
-            for evidence_id in finding.supporting_evidence_ids:
-                item = evidence_by_id[evidence_id]
-                sources.append(
-                    SourceReference(
-                        evidence_id=item.evidence_id,
-                        title=item.title,
-                        url=item.url,
-                        retrieved_at=item.retrieved_at,
-                        claims_supported=[finding.claim_id],
-                        verification_status=finding.status,
-                    )
-                )
-        final_report = await self._generate(
-            run,
-            FinalReport,
-            FINAL_SYSTEM,
-            json.dumps(
-                {
-                    "prompt": prompt,
-                    "verification_findings": [
-                        item.model_dump(mode="json") for item in verification.findings
-                    ],
-                    "sources": [item.model_dump(mode="json") for item in sources],
-                }
-            ),
-        )
-        ceo.status = AgentStatus.COMPLETED
         await self.events.emit(
-            EventType.AGENT_COMPLETED,
+            EventType.FINAL_REPORT_STARTED,
             run.run_id,
-            "CEO Agent completed final synthesis.",
+            "Final report synthesis started.",
             round_number=run.round_number,
             agent_id=ceo.agent_id,
-            metadata={"status": ceo.status.value, "llm_calls": 1},
         )
+        sources = _verified_sources(verification, evidence)
+        final_report = await run_final_synthesis(self.executor, run, ceo, verification, sources)
+        ceo.status = AgentStatus.COMPLETED
+        await self._agent_completed(run, ceo, "CEO Agent completed final synthesis.", llm_calls=1)
         await self._stage(run, RunStage.COMPLETED, "Research workflow completed.")
         await self.events.emit(
             EventType.RUN_COMPLETED,
             run.run_id,
             "Final report is ready.",
+            round_number=run.round_number,
             agent_id=ceo.agent_id,
         )
         return RuntimeResult(
@@ -325,11 +332,134 @@ class HiveMindRuntime:
             final_report=final_report,
         )
 
+    async def _plan_manager(
+        self, run: RunRecord, manager: AgentProfile, department: DepartmentSpec
+    ) -> WorkerPlan:
+        return await run_manager_planner(self.executor, run, manager, department)
+
+    async def _execute_department(
+        self,
+        run: RunRecord,
+        team: DepartmentTeam,
+        evidence: list[Evidence],
+    ) -> ManagerReport:
+        manager = team.manager
+        if manager.status == AgentStatus.FAILED:
+            return _fallback_manager_report(team, "Manager planning failed.")
+        manager.status = AgentStatus.WAITING_FOR_CHILDREN
+        await self.events.emit(
+            EventType.AGENT_STATUS_CHANGED,
+            run.run_id,
+            f"{manager.name} is waiting for workers.",
+            round_number=run.round_number,
+            agent_id=manager.agent_id,
+            parent_agent_id=manager.parent_agent_id,
+            metadata={"status": manager.status.value},
+        )
+        outcomes = await asyncio.gather(
+            *[self._execute_worker(run, spec, worker, evidence) for spec, worker in team.workers]
+        )
+        reports = [item.report for item in outcomes if item.report is not None]
+        failed = sum(item.report is None for item in outcomes)
+        await self._stage(
+            run,
+            RunStage.MANAGERS_SYNTHESIZING,
+            f"{manager.name} is combining {len(reports)} result(s).",
+        )
+        report = await run_manager_synthesis(
+            self.executor,
+            run,
+            manager,
+            department_name=team.department.name,
+            reports=reports,
+            failed_workers=failed,
+        )
+        manager.status = AgentStatus.COMPLETED
+        await self._agent_completed(
+            run,
+            manager,
+            f"{manager.name} synthesized {len(reports)} worker report(s).",
+            llm_calls=1,
+        )
+        return report
+
+    async def _execute_worker(
+        self,
+        run: RunRecord,
+        spec: WorkerSpec,
+        worker: AgentProfile,
+        evidence: list[Evidence],
+    ) -> WorkerOutcome:
+        task_id = new_id("task")
+        worker_evidence: list[Evidence] = []
+        if self.provider.name == "fake":
+            worker_evidence.append(
+                Evidence(
+                    run_id=run.run_id,
+                    task_id=task_id,
+                    agent_id=worker.agent_id,
+                    title=f"Simulated offline evidence for {spec.name}",
+                    source_type="demo_simulation",
+                    snippet="Synthetic evidence used only to exercise the workflow.",
+                    search_query=spec.search_queries[0] if spec.search_queries else None,
+                )
+            )
+            evidence.extend(worker_evidence)
+        try:
+            report = await run_worker(
+                self.executor,
+                run,
+                worker,
+                [item.evidence_id for item in worker_evidence],
+            )
+        except Exception as exc:  # noqa: BLE001 - task isolation intentionally catches providers.
+            worker.status = AgentStatus.FAILED
+            worker.tasks_failed += 1
+            await self._agent_failed(run, worker, str(exc))
+            return WorkerOutcome(report=None, error=str(exc))
+        worker.status = AgentStatus.COMPLETED
+        worker.tasks_completed += 1
+        await self._agent_completed(
+            run,
+            worker,
+            f"{worker.name} completed with {len(report.claims)} claim(s).",
+            claims=len(report.claims),
+            evidence=len(worker_evidence),
+            llm_calls=1,
+            learning_note=(
+                "A semaphore limits simultaneous model requests; the model server decides "
+                "how those requests use its hardware."
+            ),
+        )
+        return WorkerOutcome(report=report)
+
+    async def _publish_governor_decision(self, run: RunRecord, reductions: tuple[str, ...]) -> None:
+        for message in reductions:
+            await self.events.emit(
+                EventType.PLAN_REDUCED_BY_GOVERNOR,
+                run.run_id,
+                message,
+                round_number=run.round_number,
+            )
+        await self.events.emit(
+            EventType.PLAN_VALIDATED,
+            run.run_id,
+            "Governor approved the bounded plan.",
+            round_number=run.round_number,
+            metadata={
+                "learning_note": (
+                    "The model proposed roles as data; Python validated limits before "
+                    "creating any of them."
+                )
+            },
+        )
+
     async def _spawn(self, run: RunRecord, agent: AgentProfile) -> None:
         await self.events.emit(
             EventType.AGENT_SPAWNED,
             run.run_id,
             f"Created {agent.name} ({agent.kind.value}).",
+            round_number=run.round_number,
             agent_id=agent.agent_id,
             parent_agent_id=agent.parent_agent_id,
             metadata={
@@ -337,7 +467,49 @@ class HiveMindRuntime:
                 "kind": agent.kind.value,
                 "status": agent.status.value,
             },
+        )
+
+    async def _agent_completed(
+        self,
+        run: RunRecord,
+        agent: AgentProfile,
+        message: str,
+        *,
+        claims: int = 0,
+        evidence: int = 0,
+        llm_calls: int = 0,
+        learning_note: str | None = None,
+    ) -> None:
+        metadata: dict[str, object] = {
+            "status": agent.status.value,
+            "claims": claims,
+            "evidence": evidence,
+            "claims_added": claims,
+            "evidence_added": evidence,
+            "llm_calls": llm_calls,
+        }
+        if learning_note:
+            metadata["learning_note"] = learning_note
+        await self.events.emit(
+            EventType.AGENT_COMPLETED,
+            run.run_id,
+            message,
             round_number=run.round_number,
+            agent_id=agent.agent_id,
+            parent_agent_id=agent.parent_agent_id,
+            metadata=metadata,
+        )
+
+    async def _agent_failed(self, run: RunRecord, agent: AgentProfile, error: str) -> None:
+        agent.status = AgentStatus.FAILED
+        await self.events.emit(
+            EventType.AGENT_FAILED,
+            run.run_id,
+            f"{agent.name} failed; the run will continue with partial results.",
+            round_number=run.round_number,
+            agent_id=agent.agent_id,
+            parent_agent_id=agent.parent_agent_id,
+            metadata={"status": agent.status.value, "error": error[:300]},
         )
 
     async def _stage(self, run: RunRecord, stage: RunStage, message: str) -> None:
@@ -350,25 +522,73 @@ class HiveMindRuntime:
             metadata={"stage": stage.value},
         )
 
-    async def _generate(
-        self,
-        run: RunRecord,
-        schema: type[SchemaT],
-        system_prompt: str,
-        user_prompt: str,
-    ) -> SchemaT:
-        """Call a provider and expose any internal schema-repair attempt as an event."""
+    @staticmethod
+    def _profile(
+        project_id: str,
+        *,
+        role_key: str,
+        name: str,
+        kind: AgentKind,
+        objective: str,
+        parent_agent_id: str | None = None,
+        status: AgentStatus = AgentStatus.CREATED,
+    ) -> AgentProfile:
+        return AgentProfile(
+            project_id=project_id,
+            role_key=role_key,
+            name=name,
+            kind=kind,
+            role_description=objective,
+            parent_agent_id=parent_agent_id,
+            status=status,
+        )
 
-        before = int(getattr(self.provider, "validation_failures", 0))
-        try:
-            return await self.provider.generate_structured(schema, system_prompt, user_prompt)
-        finally:
-            after = int(getattr(self.provider, "validation_failures", before))
-            for _ in range(max(0, after - before)):
-                await self.events.emit(
-                    EventType.VALIDATION_FAILED,
-                    run.run_id,
-                    f"Invalid {schema.__name__} output; requested one repair.",
-                    round_number=run.round_number,
-                    metadata={"schema": schema.__name__},
+    def _manager_profile(
+        self, project_id: str, ceo: AgentProfile, department: DepartmentSpec
+    ) -> AgentProfile:
+        return self._profile(
+            project_id,
+            role_key=department.role_key,
+            name=department.manager_name,
+            kind=AgentKind.MANAGER,
+            objective=department.objective,
+            parent_agent_id=ceo.agent_id,
+            status=AgentStatus.QUEUED,
+        )
+
+
+def _fallback_manager_report(team: DepartmentTeam, error: str) -> ManagerReport:
+    """Keep final synthesis possible when a whole department fails."""
+
+    return ManagerReport(
+        department_name=team.department.name,
+        summary="The department could not produce a model-generated report.",
+        research_gaps=[error[:300]],
+        recommended_follow_up=[f"Retry {team.department.name} research."],
+    )
+
+
+def _verified_sources(
+    verification: VerificationReport, evidence: list[Evidence]
+) -> list[SourceReference]:
+    """Build source references only from evidence records that actually exist."""
+
+    evidence_by_id = {item.evidence_id: item for item in evidence}
+    sources: dict[str, SourceReference] = {}
+    for finding in verification.findings:
+        for evidence_id in finding.supporting_evidence_ids:
+            item = evidence_by_id.get(evidence_id)
+            if item is None:
+                continue
+            if evidence_id not in sources:
+                sources[evidence_id] = SourceReference(
+                    evidence_id=item.evidence_id,
+                    title=item.title,
+                    url=item.url,
+                    retrieved_at=item.retrieved_at,
+                    claims_supported=[finding.claim_id],
+                    verification_status=finding.status,
                 )
+            else:
+                sources[evidence_id].claims_supported.append(finding.claim_id)
+    return list(sources.values())
