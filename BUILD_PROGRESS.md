@@ -14,7 +14,12 @@ committed and pushed before work continues.
 - [x] Add scoped, curated memory.
 - [x] Add permissions and resilience.
 - [x] Complete tests, evaluations, and beginner documentation.
+- [x] Add an independent browser API and safe handoff observability.
+- [x] Add the interactive live agent and handoff canvas.
+- [x] Cover browser APIs, reconnect state, safety, and frontend interactions.
+- [x] Document and validate the local browser dashboard.
 
-Final acceptance baseline: 49 deterministic tests, 10 offline evaluation scenarios, Ruff
-formatting/linting, an offline CLI demo, persisted artifact validation, status reconstruction,
-resume reuse, command help, and provider diagnostics.
+Final acceptance baseline: 62 deterministic Python tests, 10 frontend tests, 10 offline
+evaluation scenarios, Ruff and ESLint, a strict TypeScript production build, an offline CLI and
+browser demo, persisted graph reconstruction, resume deduplication, command help, and provider
+diagnostics.

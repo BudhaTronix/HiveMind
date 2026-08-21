@@ -22,10 +22,12 @@ service. Future work should preserve those transparent defaults.
 
 ## Observability and orchestration
 
+- [x] Add a local browser dashboard with live organization and public handoff graphs.
 - Export traces and metrics through OpenTelemetry.
 - Evaluate LangGraph or Temporal for durable workflows without hiding policy decisions.
 - Add distributed task queues only with idempotency, leases, cancellation, and budgets.
-- Drive a browser dashboard from the same typed event stream.
+- Back browser streaming with an external broker only when multi-process serving is needed.
+- Add saved canvas layouts and read-only artifact export without changing runtime authority.
 
 ## Tools and agent interoperability
 

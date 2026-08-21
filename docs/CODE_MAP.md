@@ -18,7 +18,10 @@ tests beside each area show intended behavior.
 | Web research and tools | `src/hivemind/tools.py` | Registry, permissions, DDGS, safe HTTP |
 | URL safety | `src/hivemind/security.py` | SSRF blocking and untrusted-content wrapping |
 | Events and redaction | `src/hivemind/events.py` | Fan-out event bus and safe persisted text |
+| Public agent handoffs | `src/hivemind/observability.py` | Redacted bounded transfer contract |
 | Terminal dashboard | `src/hivemind/terminal_ui.py` | Event-derived live/plain/explain renderers |
+| Browser API | `src/hivemind/web/` | FastAPI routes, supervisor, broker, snapshots |
+| Browser canvas | `web/src/` | React Flow graph, reducer, inspector, timeline |
 | Provider contract | `src/hivemind/providers/base.py` | Protocol, validation, and repair behavior |
 | Offline simulation | `src/hivemind/providers/fake_provider.py` | Deterministic prompt-sensitive responses |
 | Ollama integration | `src/hivemind/providers/ollama_provider.py` | Local model calls and health checks |
@@ -35,6 +38,8 @@ tests beside each area show intended behavior.
 5. Follow one event from `events.py` to SQLite, JSONL, and `terminal_ui.py`.
 6. Read `tools.py` together with `security.py`.
 7. Finish with persistence/resume and memory curation.
+8. Compare `terminal_ui.py` with `web/src/state/reducer.ts`: both reconstruct presentation
+   from public records, while only the browser also renders explicit safe handoffs.
 
 There is no generated framework code or hidden orchestration layer. The explicit calls are the
 architecture.

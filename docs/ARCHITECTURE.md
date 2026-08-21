@@ -7,18 +7,15 @@ while the runtime validates, schedules, persists, and presents them.
 ## Control flow
 
 ```text
-Typer CLI
-   |
-   +--> Settings --> Provider adapter
-   |                    |
-   +--> SQLite <--> Runtime <--> Event bus --> Rich/plain renderer
-                         |
-                         +--> CEO planner
-                         +--> Governor
-                         +--> Managers --> Workers --> registered tools
-                         +--> Verifier --> QA --> bounded follow-up
-                         +--> Memory curator
-                         `--> Final synthesis --> artifact store
+Typer CLI --------------------------> Rich/plain renderer
+   |                                          ^
+   |                                          |
+   +--> Settings --> Provider --> Runtime <--> Event bus --> SQLite / JSONL
+                                  |   |
+Browser API --> Run supervisor ---+   `--> bounded live broker --> WebSocket --> React canvas
+                                  |
+                                  `--> Handoff observer --> SQLite --> live broker
+                                       (validated public transfers only)
 ```
 
 The organization depth is fixed at CEO → Manager → Worker. Verifier, QA, and memory curator are
@@ -45,6 +42,11 @@ records and asynchronous model calls, not independent services.
   limits excerpts, and supplies redaction helpers with `events.py`.
 - `events.py` fans immutable typed events out to storage and presentation.
 - `terminal_ui.py` derives its visible state from those events.
+- `observability.py` defines bounded, redacted, idempotent public handoffs and the optional
+  runtime observer. Its default is a no-op, so CLI composition and output are unchanged.
+- `web/` composes a separate FastAPI service, task supervisor, snapshot builder, bounded live
+  broker, and WebSocket protocol without importing CLI helpers.
+- top-level `web/` contains the strict TypeScript React canvas and its deterministic reducer.
 
 ## Data and public contracts
 
@@ -58,8 +60,21 @@ validates against the requested Pydantic model; provider adapters attempt one re
 invalid output and then raise an actionable `ProviderError`.
 
 The runtime accepts its provider, repository, event bus, governor, registry, tool registry,
-memory store, and artifact store as small injected dependencies. This makes failure behavior
-testable without live services.
+memory store, artifact store, and optional observer as small injected dependencies. This makes
+failure behavior testable without live services.
+
+## Two observability streams
+
+`HiveEvent` records lifecycle and state: stages, spawns, statuses, retries, tool activity, and
+terminal outcomes. Both terminal and browser presentation reconstruct state from these public
+records. `AgentHandoff` records concise validated data that genuinely crossed an agent boundary,
+such as an assignment or worker report. Handoffs are separate so the terminal event stream and
+existing CLI output do not change merely to support a browser.
+
+Handoff IDs derive from the run, round, source, target, kind, and task key. Replaying a resume
+therefore upserts rather than duplicates them. Recursive collection and text bounds plus the
+existing redaction functions prevent the preview from becoming a provider-data or external-page
+dump. No contract captures hidden reasoning, system prompts, provider bodies, or secrets.
 
 ## Scheduling and resilience
 
@@ -89,16 +104,17 @@ misinterpret it.
 
 ## Persistence
 
-SQLite tables store schema metadata, projects, runs, agents, tasks, events, evidence, claims,
-reports, memories, artifacts, and tool calls. JSON is used for typed payload snapshots where a
-relational expansion would make this educational version harder to follow. Per-run artifacts
-make the same information easy to inspect outside SQLite.
+SQLite tables store schema metadata, projects, runs, agents, tasks, events, handoffs, evidence,
+claims, reports, memories, artifacts, and tool calls. The handoff table is an additive schema-v2
+upgrade; opening an existing v1 database preserves its records. JSON is used for typed payload
+snapshots where a relational expansion would make this educational version harder to follow.
+Per-run artifacts make the same information easy to inspect outside SQLite.
 
 ## Intentional version 1 exclusions
 
 Version 1 does not include PostgreSQL, a distributed queue, autonomous service-to-service
 agents, unlimited recursive hierarchies, a generic model-directed tool loop, shell or filesystem
-agent tools, browser automation, hidden chain-of-thought capture, a browser dashboard, or
+agent tools, browser automation, hidden chain-of-thought capture, multi-user web serving, or
 production authorization and tenancy. No external service is mandatory for the demo or tests.
 
 Possible future upgrades include:
@@ -109,7 +125,7 @@ Possible future upgrades include:
 - LangGraph or Temporal for durable production workflows.
 - MCP tools and A2A agent services with explicit trust boundaries.
 - Distributed task queues and independently scalable workers.
-- A browser dashboard driven by the existing event stream.
+- Durable multi-process browser streaming backed by an external broker.
 - Sandboxed code execution.
 - Deeper but still bounded recursion.
 - A real human approval interface for consequential actions.

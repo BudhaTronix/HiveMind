@@ -111,6 +111,54 @@ hivemind run "Compare two database migration strategies" --provider openai
 In PowerShell, use `$env:OPENAI_API_KEY = "your-key"`. Never commit `.env` or paste a key into
 a prompt. Provider-specific code is isolated in `src/hivemind/providers/`.
 
+## Browser workflow canvas
+
+The browser dashboard is a second interface; it does not replace or alter any `hivemind`
+command. It shows the organization and actual public agent-to-agent handoffs as a live,
+interactive graph. Node dragging changes only your local presentation—not the runtime plan,
+hierarchy, or permissions.
+
+Prerequisites are Python 3.11+ and Node.js 20 or 22+. Install the optional server dependencies
+and frontend packages:
+
+```bash
+python -m pip install -e '.[web]'
+cd web
+npm ci
+```
+
+For development, use two terminals from the repository root:
+
+```bash
+# Terminal 1: API and WebSocket server
+hivemind-web
+
+# Terminal 2: Vite development server
+cd web
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`, choose **New Run**, and leave **Fake · offline** selected for a
+complete demo without a model server, API key, web access, or other service. Vite proxies only
+the API and WebSocket paths to the local backend.
+
+For a production frontend build served by FastAPI:
+
+```bash
+cd web
+npm run build
+cd ..
+hivemind-web
+# Open http://127.0.0.1:8000
+```
+
+For Ollama, start Ollama and pull the model before selecting it in the dialog. For OpenAI, set
+`OPENAI_API_KEY` in the backend process environment; credentials are intentionally absent from
+all browser requests and responses. `hivemind-web` binds to `127.0.0.1` and uses one Uvicorn
+worker by default. The active task registry and live broker are process-local, so multi-worker
+serving is not supported in this educational version. See [Web UI](docs/WEB_UI.md) for the
+protocol, privacy boundary, and development architecture.
+
 ## Command reference
 
 ```text
@@ -200,10 +248,16 @@ when you deliberately want the extra local inference time.
 ## Development and evaluations
 
 ```bash
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[dev,web]'
 ruff check .
 pytest
 python evals/run_evals.py
+
+cd web
+npm ci
+npm run lint
+npm run test -- --run
+npm run build
 ```
 
 Tests use temporary databases and injected fake providers/web clients. They do not contact
@@ -214,6 +268,7 @@ workflow invariants rather than asking another model to subjectively grade prose
 ## Learn and troubleshoot
 
 - [Architecture](docs/ARCHITECTURE.md) explains control flow, contracts, and intentional limits.
+- [Web UI](docs/WEB_UI.md) explains the browser canvas, live protocol, and privacy boundary.
 - [Learning guide](docs/LEARNING_GUIDE.md) teaches the underlying concepts in order.
 - [Code map](docs/CODE_MAP.md) points from each concept to its implementation.
 - [Walkthrough](docs/WALKTHROUGH.md) follows one prompt from CLI to artifacts.
@@ -224,10 +279,11 @@ workflow invariants rather than asking another model to subjectively grade prose
 
 ## Limitations
 
-Version 1 is a single Python process with SQLite and bounded three-level organization. It has no
-distributed scheduler, browser UI, shell/filesystem tools for agents, general autonomous tool
-loop, or production human-approval interface. Keyword memory is intentionally simple. DDGS may
-be unavailable or rate-limited. Local model quality depends strongly on model and hardware.
+Version 1 is a single Python process with SQLite and bounded three-level organization. Its live
+browser broker supports one Uvicorn worker; it is not a multi-user or remotely exposed service.
+It has no distributed scheduler, shell/filesystem tools for agents, general autonomous tool loop,
+or production human-approval interface. Keyword memory is intentionally simple. DDGS may be
+unavailable or rate-limited. Local model quality depends strongly on model and hardware.
 Structured validation, verification, and citations reduce mistakes but cannot guarantee truth.
 
 See [ROADMAP.md](ROADMAP.md) for deliberately deferred production-oriented upgrades.
