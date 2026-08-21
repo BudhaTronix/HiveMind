@@ -83,6 +83,7 @@ function Canvas({ state, view, onViewChange, onSelectAgent, onSelectHandoff }: P
         <button className="icon-button" aria-label="Reset graph layout" title="Reset layout" onClick={resetLayout}><LocateFixed size={16} /></button>
         <button className="icon-button" aria-label={locked ? 'Unlock node positions' : 'Lock node positions'} title="Lock layout" onClick={() => setLocked((value) => !value)}>{locked ? <Lock size={16} /> : <Unlock size={16} />}</button>
       </div>
+      {view === 'handoffs' && <nav className="sr-only" aria-label="Handoff graph edges">{Object.values(state.handoffs).map((handoff) => <button key={handoff.handoff_id} aria-label={`Open handoff ${handoff.title}`} onClick={() => onSelectHandoff(handoff.handoff_id)}>{handoff.title}</button>)}</nav>}
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -120,6 +121,8 @@ function edgeList(state: DashboardState, view: 'organization' | 'handoffs'): Edg
     target: handoff.target_agent_id,
     label: handoff.kind.replace('_', ' '),
     data: { handoffId: handoff.handoff_id },
+    ariaLabel: `Handoff: ${handoff.title}`,
+    focusable: true,
     className: 'handoff-edge',
     animated: Date.now() - new Date(handoff.created_at).getTime() < 12_000,
   }))

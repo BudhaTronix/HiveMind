@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hivemind.observability import AgentHandoff
 from hivemind.schemas import (
@@ -21,6 +21,8 @@ from hivemind.schemas import (
 
 
 class NewRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     prompt: str = Field(min_length=1, max_length=12_000)
     project_id: str = Field(default="web-project", min_length=1, max_length=100)
     provider: Literal["fake", "ollama", "openai"] = "fake"
