@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     )
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_model: str = Field(default="qwen3:8b", alias="OLLAMA_MODEL")
+    ollama_think: bool = Field(default=False, alias="OLLAMA_THINK")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
 
@@ -54,6 +55,9 @@ class Settings(BaseSettings):
         default=2, ge=0, le=5, alias="HIVEMIND_MAX_SEARCH_QUERIES_PER_WORKER"
     )
     max_retries: int = Field(default=2, ge=0, le=5, alias="HIVEMIND_MAX_RETRIES")
+    llm_call_timeout_seconds: int = Field(
+        default=300, ge=30, le=3600, alias="HIVEMIND_LLM_CALL_TIMEOUT_SECONDS"
+    )
     max_runtime_seconds: int = Field(
         default=900, ge=10, le=86400, alias="HIVEMIND_MAX_RUNTIME_SECONDS"
     )

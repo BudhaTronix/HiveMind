@@ -3,11 +3,13 @@
 from types import SimpleNamespace
 from typing import Any, TypeVar
 
+import httpx
+import pytest
 from pydantic import BaseModel
 
 from hivemind.config import Settings
 from hivemind.events import EventBus
-from hivemind.providers.base import ValidatingProvider
+from hivemind.providers.base import ProviderError, ValidatingProvider
 from hivemind.providers.ollama_provider import OllamaProvider
 from hivemind.providers.openai_provider import OpenAIProvider
 from hivemind.runtime import HiveMindRuntime
@@ -46,6 +48,20 @@ class StubOllamaClient:
         return SimpleNamespace(models=[SimpleNamespace(model="qwen3:8b")])
 
 
+class RecordingOllamaClient(StubOllamaClient):
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> SimpleNamespace:
+        self.requests.append(kwargs)
+        return SimpleNamespace(message=SimpleNamespace(content='{"value": 42}'))
+
+
+class TimingOutOllamaClient(StubOllamaClient):
+    async def chat(self, **kwargs: Any) -> SimpleNamespace:
+        raise httpx.ReadTimeout("generation took too long")
+
+
 async def test_invalid_structured_output_is_retried_once() -> None:
     provider = BrokenThenValidProvider()
 
@@ -67,6 +83,38 @@ async def test_ollama_health_checks_requested_model() -> None:
 
     assert health.ok
     assert "qwen3:8b" in health.message
+
+
+async def test_ollama_structured_calls_disable_thinking_and_lower_temperature() -> None:
+    client = RecordingOllamaClient()
+    provider = OllamaProvider(
+        model="qwen3:8b",
+        base_url="http://localhost:11434",
+        think=False,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    answer = await provider.generate_structured(Answer, "System", "User")
+
+    assert answer.value == 42
+    assert client.requests[0]["think"] is False
+    assert client.requests[0]["options"] == {"temperature": 0}
+
+
+async def test_ollama_generation_timeout_is_not_reported_as_connection_failure() -> None:
+    provider = OllamaProvider(
+        model="qwen3:8b",
+        base_url="http://localhost:11434",
+        timeout_seconds=300,
+        client=TimingOutOllamaClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ProviderError, match="did not finish within 300 seconds") as failure:
+        await provider.generate_text("System", "User")
+
+    assert not failure.value.retryable
+    assert "could not connect" not in str(failure.value)
+    assert "OLLAMA_THINK=false" in str(failure.value)
 
 
 async def test_openai_health_does_not_make_request_without_key() -> None:

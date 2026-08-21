@@ -77,8 +77,10 @@ is deliberately understandable rather than a hidden workflow engine.
 
 Web search only discovers candidate URLs. Python fetches each page through URL validation,
 converts accepted public text/HTML into a bounded untrusted excerpt, and creates an evidence
-record. Claims refer to evidence IDs. Before artifacts are written, references that do not exist
-in the run’s evidence set are rejected. Verification states remain visible as `verified`,
+record. Models receive short evidence aliases that Python resolves back to stored IDs, avoiding
+copy errors from long identifiers. Claims refer to those resolved IDs. Before artifacts are
+written, references that do not exist in the run’s evidence set are rejected. Verification
+states remain visible as `verified`,
 `partial`, `uncertain`, or `contradicted`.
 
 This establishes traceability, not truth. A source can itself be wrong, and a model can

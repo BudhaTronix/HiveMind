@@ -27,18 +27,23 @@ class OllamaProvider(ValidatingProvider):
         *,
         model: str,
         base_url: str,
+        think: bool = False,
+        timeout_seconds: float = 300,
         client: AsyncClient | None = None,
     ) -> None:
         super().__init__()
         self.model = model
         self.base_url = base_url.rstrip("/")
-        self.client = client or AsyncClient(host=self.base_url, timeout=120)
+        self.think = think
+        self.timeout_seconds = timeout_seconds
+        self.client = client or AsyncClient(host=self.base_url, timeout=timeout_seconds)
 
     async def generate_text(self, system_prompt: str, user_prompt: str) -> str:
         """Request a normal non-streaming chat response."""
 
         response = await self._chat(
             messages=_messages(system_prompt, user_prompt),
+            think=self.think,
         )
         return response.message.content or ""
 
@@ -51,6 +56,8 @@ class OllamaProvider(ValidatingProvider):
         response = await self._chat(
             messages=_messages(system_prompt, user_prompt),
             format=schema.model_json_schema(),
+            think=self.think,
+            options={"temperature": 0},
         )
         return response.message.content or ""
 
@@ -66,7 +73,18 @@ class OllamaProvider(ValidatingProvider):
                     retryable=False,
                 ) from exc
             raise ProviderError(f"Ollama rejected the request: {exc}") from exc
-        except (httpx.ConnectError, httpx.TimeoutException, OSError) as exc:
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                (
+                    f"Ollama model '{self.model}' did not finish within "
+                    f"{self.timeout_seconds:g} seconds. The server was reachable, but "
+                    "generation was too slow. Keep OLLAMA_THINK=false, try "
+                    "--max-concurrent 1 or a smaller model, or increase "
+                    "HIVEMIND_LLM_CALL_TIMEOUT_SECONDS."
+                ),
+                retryable=False,
+            ) from exc
+        except (httpx.ConnectError, OSError) as exc:
             raise ProviderError(self.connection_help) from exc
 
     async def check_health(self) -> ProviderHealth:

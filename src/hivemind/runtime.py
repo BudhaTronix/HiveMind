@@ -28,12 +28,13 @@ from hivemind.governor import Governor
 from hivemind.memory import MemoryStore, create_memory_store
 from hivemind.persistence import ArtifactStore, HiveMindRepository
 from hivemind.providers import create_provider
-from hivemind.providers.base import LLMProvider
+from hivemind.providers.base import LLMProvider, ProviderError
 from hivemind.registry import AgentRegistry
 from hivemind.schemas import (
     AgentKind,
     AgentProfile,
     AgentStatus,
+    Claim,
     CompanyPlan,
     CurationDecision,
     DepartmentSpec,
@@ -129,7 +130,10 @@ class HiveMindRuntime:
             event_bus,
             max_concurrent_calls=self.governor.limits.max_concurrent_llm_calls,
             max_attempts=self.governor.limits.max_retries_per_task + 1,
-            call_timeout_seconds=min(180, self.governor.limits.max_runtime_seconds),
+            call_timeout_seconds=min(
+                settings.llm_call_timeout_seconds,
+                self.governor.limits.max_runtime_seconds,
+            ),
             repository=repository,
             provider_router=self._provider_for_agent,
         )
@@ -374,6 +378,8 @@ class HiveMindRuntime:
             sources,
             approved_memories,
         )
+        # Python owns citation integrity instead of trusting the model to reproduce IDs.
+        final_report = final_report.model_copy(update={"sources": sources})
         if not qa.can_finalize:
             final_report.research_limitations.append(
                 f"QA gaps remained after the maximum of {run.max_rounds} research round(s)."
@@ -534,6 +540,18 @@ class HiveMindRuntime:
                 await self._spawn(run, profile)
             teams.append(DepartmentTeam(department, manager, worker_profiles))
 
+        if manager_plan_results and all(
+            isinstance(result, BaseException) for result in manager_plan_results
+        ):
+            first_error = next(
+                str(result) for result in manager_plan_results if isinstance(result, BaseException)
+            )
+            raise ProviderError(
+                "All manager planning requests failed, so HiveMind cannot produce a "
+                f"research-backed report. First failure: {first_error}",
+                retryable=False,
+            )
+
         await self._stage(
             run, RunStage.WORKERS_RESEARCHING, "Approved workers are researching concurrently."
         )
@@ -672,6 +690,7 @@ class HiveMindRuntime:
             reports=reports,
             failed_workers=failed,
         )
+        report = _preserve_worker_claims(report, reports)
         if self.repository:
             await self.repository.save_report(
                 run.run_id,
@@ -1280,6 +1299,28 @@ def _fallback_manager_report(team: DepartmentTeam, error: str) -> ManagerReport:
         research_gaps=[error[:300]],
         recommended_follow_up=[f"Retry {team.department.name} research."],
     )
+
+
+def _preserve_worker_claims(
+    report: ManagerReport, worker_reports: list[WorkerReport]
+) -> ManagerReport:
+    """Prevent a lossy model synthesis from silently dropping grounded worker claims."""
+
+    merged = list(report.merged_claims)
+    seen_ids = {claim.claim_id for claim in merged}
+    seen_content = {_claim_identity(claim) for claim in merged}
+    for worker_report in worker_reports:
+        for claim in worker_report.claims:
+            identity = _claim_identity(claim)
+            if claim.claim_id not in seen_ids and identity not in seen_content:
+                merged.append(claim)
+                seen_ids.add(claim.claim_id)
+                seen_content.add(identity)
+    return report.model_copy(update={"merged_claims": merged})
+
+
+def _claim_identity(claim: Claim) -> tuple[str, tuple[str, ...]]:
+    return claim.text.casefold().strip(), tuple(sorted(claim.evidence_ids))
 
 
 def _verified_sources(

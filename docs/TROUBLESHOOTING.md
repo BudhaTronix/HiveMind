@@ -54,6 +54,24 @@ model does not reliably follow the schema or its context is overloaded. Try a st
 reduce the prompt, or reproduce with `hivemind demo`. Use `--debug` only when you need the
 developer traceback.
 
+## Ollama generation is slow or times out
+
+HiveMind defaults to `OLLAMA_THINK=false` because thinking-capable models such as Qwen 3 can
+spend much longer generating reasoning that the structured workflow does not use. Confirm that
+setting first. The model-call limit defaults to 300 seconds and is configurable with
+`HIVEMIND_LLM_CALL_TIMEOUT_SECONDS`.
+
+If the machine cannot comfortably serve several generations at once, run with:
+
+```bash
+hivemind run "your question" --max-concurrent 1
+```
+
+A generation timeout is reported separately from a connection failure and is not automatically
+repeated for another multi-minute attempt. Consider a smaller model before raising the timeout.
+If every manager plan fails, the run now ends as failed instead of presenting an empty report as
+successful.
+
 ## Web search or fetch fails
 
 DDGS can be rate-limited or temporarily unavailable. A site may block automated clients, return

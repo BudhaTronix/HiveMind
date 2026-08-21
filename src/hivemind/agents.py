@@ -155,6 +155,15 @@ class AgentExecutor:
                         result = await active_provider.generate_structured(
                             schema, system_prompt, json.dumps(payload)
                         )
+            except TimeoutError:
+                last_error = ProviderError(
+                    (
+                        f"{active_provider.name} model '{active_provider.model}' did not finish "
+                        f"within {self.call_timeout_seconds:g} seconds. Try a smaller model, "
+                        "reduce concurrency, or increase HIVEMIND_LLM_CALL_TIMEOUT_SECONDS."
+                    ),
+                    retryable=False,
+                )
             except Exception as exc:  # noqa: BLE001 - retry policy classifies the exception.
                 last_error = exc
             after = int(getattr(active_provider, "validation_failures", before))
@@ -274,18 +283,23 @@ async def run_worker(
     evidence: list[Evidence],
     memories: list[MemoryRecord] | None = None,
 ) -> WorkerReport:
-    return await executor.structured(
+    aliases = {f"evidence_{index}": item.evidence_id for index, item in enumerate(evidence)}
+    report = await executor.structured(
         run,
         worker,
         WorkerReport,
         WORKER_SYSTEM,
         {
             "role_key": worker.role_key,
-            "evidence_ids": [item.evidence_id for item in evidence],
-            "evidence": [_evidence_for_prompt(item) for item in evidence],
+            "evidence_ids": list(aliases),
+            "evidence": [
+                _evidence_for_prompt(item, evidence_id=alias)
+                for alias, item in zip(aliases, evidence, strict=True)
+            ],
             "memories": _memory_text(memories or []),
         },
     )
+    return _resolve_worker_evidence_aliases(report, aliases)
 
 
 async def run_manager_synthesis(
@@ -318,32 +332,115 @@ async def run_verifier(
     claims: list[BaseModel],
     evidence: list[Evidence],
 ) -> VerificationReport:
-    return await executor.structured(
+    aliases = {f"evidence_{index}": item.evidence_id for index, item in enumerate(evidence)}
+    aliases_by_id = {evidence_id: alias for alias, evidence_id in aliases.items()}
+    claim_payloads = []
+    for item in claims:
+        payload = item.model_dump(mode="json")
+        payload["evidence_ids"] = [
+            aliases_by_id[evidence_id]
+            for evidence_id in payload.get("evidence_ids", [])
+            if evidence_id in aliases_by_id
+        ]
+        claim_payloads.append(payload)
+    report = await executor.structured(
         run,
         verifier,
         VerificationReport,
         VERIFIER_SYSTEM,
         {
-            "claims": [item.model_dump(mode="json") for item in claims],
-            "evidence_ids": [item.evidence_id for item in evidence],
-            "evidence": [_evidence_for_prompt(item) for item in evidence],
+            "claims": claim_payloads,
+            "evidence_ids": list(aliases),
+            "evidence": [
+                _evidence_for_prompt(item, evidence_id=alias)
+                for alias, item in zip(aliases, evidence, strict=True)
+            ],
         },
         status=AgentStatus.VERIFYING,
     )
+    return _resolve_verification_evidence_aliases(report, aliases)
 
 
-def _evidence_for_prompt(item: Evidence) -> dict[str, object]:
+def _evidence_for_prompt(item: Evidence, *, evidence_id: str | None = None) -> dict[str, object]:
     """Expose bounded evidence while keeping external text inside trust markers."""
 
     content = item.content_excerpt or item.snippet
     return {
-        "evidence_id": item.evidence_id,
+        "evidence_id": evidence_id or item.evidence_id,
         "title": item.title,
         "url": item.url,
         "source_type": item.source_type,
         "retrieved_at": item.retrieved_at.isoformat(),
         "content": wrap_untrusted_content(content, source_url=item.url),
     }
+
+
+def _resolve_worker_evidence_aliases(report: WorkerReport, aliases: dict[str, str]) -> WorkerReport:
+    """Resolve short prompt aliases and discard references the worker never received."""
+
+    allowed = set(aliases.values())
+    claims = []
+    for claim in report.claims:
+        resolved = [
+            actual
+            for reference in claim.evidence_ids
+            if (actual := aliases.get(reference, reference)) in allowed
+        ]
+        resolved = list(dict.fromkeys(resolved))
+        limitations = list(claim.limitations)
+        if claim.evidence_ids and not resolved:
+            limitations.append("The model returned no valid evidence reference for this claim.")
+        claims.append(
+            claim.model_copy(
+                update={
+                    "evidence_ids": resolved,
+                    "limitations": list(dict.fromkeys(limitations)),
+                }
+            )
+        )
+    candidates = [
+        candidate.model_copy(
+            update={
+                "source_evidence_ids": list(
+                    dict.fromkeys(
+                        actual
+                        for reference in candidate.source_evidence_ids
+                        if (actual := aliases.get(reference, reference)) in allowed
+                    )
+                )
+            }
+        )
+        for candidate in report.memory_candidates
+    ]
+    return report.model_copy(update={"claims": claims, "memory_candidates": candidates})
+
+
+def _resolve_verification_evidence_aliases(
+    report: VerificationReport, aliases: dict[str, str]
+) -> VerificationReport:
+    """Resolve verifier aliases while rejecting evidence it was never supplied."""
+
+    allowed = set(aliases.values())
+
+    def resolve(references: list[str]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                actual
+                for reference in references
+                if (actual := aliases.get(reference, reference)) in allowed
+            )
+        )
+
+    findings = [
+        finding.model_copy(
+            update={
+                "supporting_evidence_ids": resolve(finding.supporting_evidence_ids),
+                "conflicting_evidence_ids": resolve(finding.conflicting_evidence_ids),
+            }
+        )
+        for finding in report.findings
+    ]
+    return report.model_copy(update={"findings": findings})
 
 
 async def run_qa(

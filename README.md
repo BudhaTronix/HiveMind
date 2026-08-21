@@ -180,6 +180,7 @@ Copy `.env.example` to `.env` and edit only what you need. Important defaults in
 ```dotenv
 HIVEMIND_PROVIDER=ollama
 OLLAMA_MODEL=qwen3:8b
+OLLAMA_THINK=false
 HIVEMIND_ENABLE_WEB=true
 HIVEMIND_MEMORY_BACKEND=simple
 HIVEMIND_MAX_MANAGERS=3
@@ -187,11 +188,14 @@ HIVEMIND_MAX_WORKERS_PER_MANAGER=3
 HIVEMIND_MAX_TOTAL_AGENTS=15
 HIVEMIND_MAX_CONCURRENT_LLM_CALLS=3
 HIVEMIND_MAX_RESEARCH_ROUNDS=2
+HIVEMIND_LLM_CALL_TIMEOUT_SECONDS=300
 ```
 
 Per-role model overrides are available as `HIVEMIND_MODEL_CEO`, `HIVEMIND_MODEL_MANAGER`,
 `HIVEMIND_MODEL_WORKER`, `HIVEMIND_MODEL_VERIFIER`, `HIVEMIND_MODEL_QA`, and
-`HIVEMIND_MODEL_MEMORY`.
+`HIVEMIND_MODEL_MEMORY`. Ollama thinking is disabled by default because this workflow needs
+concise schema-shaped results rather than long reasoning traces. Set `OLLAMA_THINK=true` only
+when you deliberately want the extra local inference time.
 
 ## Development and evaluations
 

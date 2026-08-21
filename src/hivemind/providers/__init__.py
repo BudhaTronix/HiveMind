@@ -20,6 +20,8 @@ def create_provider(settings: Settings) -> LLMProvider:
     return OllamaProvider(
         model=settings.ollama_model,
         base_url=settings.ollama_base_url,
+        think=settings.ollama_think,
+        timeout_seconds=settings.llm_call_timeout_seconds,
     )
 
 
