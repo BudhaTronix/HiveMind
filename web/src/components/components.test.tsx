@@ -5,8 +5,9 @@ import { GraphCanvas } from './GraphCanvas'
 import { Inspector } from './Inspector'
 import { NewRunDialog } from './NewRunDialog'
 import { RunSidebar } from './RunSidebar'
+import { Timeline } from './Timeline'
 import { dashboardReducer, initialState } from '../state/reducer'
-import { agent, details, handoff, snapshot } from '../test/factories'
+import { agent, details, event, handoff, snapshot } from '../test/factories'
 
 afterEach(() => vi.restoreAllMocks())
 
@@ -61,5 +62,27 @@ describe('interactive dashboard components', () => {
     expect(toggle).toHaveBeenCalledOnce()
     await userEvent.click(screen.getByRole('button', { name: `Delete run: ${completedRun.prompt}` }))
     expect(remove).toHaveBeenCalledWith(completedRun)
+  })
+
+  it('shows event cards on a horizontal timeline and collapses to its bottom bar', async () => {
+    const data = snapshot()
+    data.agents = [agent(), agent('agent_worker', 'worker', 'agent_ceo')]
+    data.events = [event()]
+    data.handoffs = [handoff()]
+    const state = dashboardReducer(initialState, { type: 'snapshot', snapshot: data })
+    const selectAgent = vi.fn()
+    const selectHandoff = vi.fn()
+    render(<Timeline state={state} onFocusAgent={selectAgent} onFocusHandoff={selectHandoff} />)
+
+    await userEvent.click(screen.getByRole('button', { name: 'agent spawned: Created Research Worker.' }))
+    expect(selectAgent).toHaveBeenCalledWith('agent_worker')
+    await userEvent.click(screen.getByRole('button', { name: 'worker report: Worker findings' }))
+    expect(selectHandoff).toHaveBeenCalledWith('handoff_one')
+
+    const timeline = screen.getByRole('region', { name: 'Run event timeline' })
+    await userEvent.click(screen.getByRole('button', { name: 'Collapse timeline' }))
+    expect(timeline).toHaveClass('collapsed')
+    expect(screen.queryByRole('button', { name: 'worker report: Worker findings' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Expand timeline' })).toHaveAttribute('aria-expanded', 'false')
   })
 })

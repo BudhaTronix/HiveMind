@@ -161,3 +161,8 @@ reconstruction and deduplication, live spawn/follow/pinning behavior, structured
 selection, message inspection, edge selection, sidebar controls, and keyboard-accessible safe
 controls. Live envelopes are applied in short batches, Dagre reruns only when graph topology
 changes, and selected-agent refetches are scoped and debounced.
+
+The timeline uses a horizontally scrollable card-and-marker track. Cards alternate around the
+time axis, keep the latest activity in view until the user scrolls back, and retain the existing
+agent, type, and severity filters. Collapsing it leaves only a compact bottom bar so the workflow
+canvas immediately receives the released vertical space.
