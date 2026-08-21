@@ -54,6 +54,7 @@ from hivemind.schemas import (
     RuntimeCheckpoint,
     SourceReference,
     VerificationReport,
+    VerificationStatus,
     WorkerPlan,
     WorkerReport,
     WorkerSpec,
@@ -379,7 +380,12 @@ class HiveMindRuntime:
             approved_memories,
         )
         # Python owns citation integrity instead of trusting the model to reproduce IDs.
-        final_report = final_report.model_copy(update={"sources": sources})
+        final_report = final_report.model_copy(
+            update={
+                "key_findings": _final_key_findings(verification, manager_reports),
+                "sources": sources,
+            }
+        )
         if not qa.can_finalize:
             final_report.research_limitations.append(
                 f"QA gaps remained after the maximum of {run.max_rounds} research round(s)."
@@ -1321,6 +1327,26 @@ def _preserve_worker_claims(
 
 def _claim_identity(claim: Claim) -> tuple[str, tuple[str, ...]]:
     return claim.text.casefold().strip(), tuple(sorted(claim.evidence_ids))
+
+
+def _final_key_findings(
+    verification: VerificationReport, manager_reports: list[ManagerReport]
+) -> list[str]:
+    """Render actual claim text with the status Python validated for that claim."""
+
+    claims = {claim.claim_id: claim for report in manager_reports for claim in report.merged_claims}
+    labels = {
+        VerificationStatus.VERIFIED: "Verified",
+        VerificationStatus.PARTIALLY_VERIFIED: "Partially verified",
+        VerificationStatus.UNVERIFIED: "Unverified",
+        VerificationStatus.CONTRADICTED: "Contradicted",
+    }
+    findings = [
+        f"{labels[finding.status]} — {claim.text}"
+        for finding in verification.findings
+        if (claim := claims.get(finding.claim_id)) is not None
+    ]
+    return findings[:12] or ["Unverified — No evidence-linked findings were available."]
 
 
 def _verified_sources(

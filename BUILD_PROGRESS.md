@@ -15,6 +15,6 @@ committed and pushed before work continues.
 - [x] Add permissions and resilience.
 - [x] Complete tests, evaluations, and beginner documentation.
 
-Final acceptance baseline: 48 deterministic tests, 10 offline evaluation scenarios, Ruff
+Final acceptance baseline: 49 deterministic tests, 10 offline evaluation scenarios, Ruff
 formatting/linting, an offline CLI demo, persisted artifact validation, status reconstruction,
 resume reuse, command help, and provider diagnostics.

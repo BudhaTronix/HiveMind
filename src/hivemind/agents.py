@@ -30,6 +30,7 @@ from hivemind.providers.base import LLMProvider, ProviderError
 from hivemind.schemas import (
     AgentProfile,
     AgentStatus,
+    Claim,
     CompanyPlan,
     CurationResult,
     EventType,
@@ -43,7 +44,9 @@ from hivemind.schemas import (
     RunRecord,
     TaskRecord,
     TaskStatus,
+    VerificationFinding,
     VerificationReport,
+    VerificationStatus,
     WorkerPlan,
     WorkerReport,
     utc_now,
@@ -329,14 +332,16 @@ async def run_verifier(
     executor: AgentExecutor,
     run: RunRecord,
     verifier: AgentProfile,
-    claims: list[BaseModel],
+    claims: list[Claim],
     evidence: list[Evidence],
 ) -> VerificationReport:
     aliases = {f"evidence_{index}": item.evidence_id for index, item in enumerate(evidence)}
     aliases_by_id = {evidence_id: alias for alias, evidence_id in aliases.items()}
+    claim_aliases = {f"claim_{index}": item.claim_id for index, item in enumerate(claims, start=1)}
     claim_payloads = []
-    for item in claims:
+    for alias, item in zip(claim_aliases, claims, strict=True):
         payload = item.model_dump(mode="json")
+        payload["claim_id"] = alias
         payload["evidence_ids"] = [
             aliases_by_id[evidence_id]
             for evidence_id in payload.get("evidence_ids", [])
@@ -358,7 +363,8 @@ async def run_verifier(
         },
         status=AgentStatus.VERIFYING,
     )
-    return _resolve_verification_evidence_aliases(report, aliases)
+    report = _resolve_verification_aliases(report, aliases, claim_aliases)
+    return _enforce_verification_integrity(report, claims)
 
 
 def _evidence_for_prompt(item: Evidence, *, evidence_id: str | None = None) -> dict[str, object]:
@@ -415,25 +421,28 @@ def _resolve_worker_evidence_aliases(report: WorkerReport, aliases: dict[str, st
     return report.model_copy(update={"claims": claims, "memory_candidates": candidates})
 
 
-def _resolve_verification_evidence_aliases(
-    report: VerificationReport, aliases: dict[str, str]
+def _resolve_verification_aliases(
+    report: VerificationReport,
+    evidence_aliases: dict[str, str],
+    claim_aliases: dict[str, str],
 ) -> VerificationReport:
-    """Resolve verifier aliases while rejecting evidence it was never supplied."""
+    """Resolve short verifier IDs while rejecting evidence it was never supplied."""
 
-    allowed = set(aliases.values())
+    allowed = set(evidence_aliases.values())
 
     def resolve(references: list[str]) -> list[str]:
         return list(
             dict.fromkeys(
                 actual
                 for reference in references
-                if (actual := aliases.get(reference, reference)) in allowed
+                if (actual := evidence_aliases.get(reference, reference)) in allowed
             )
         )
 
     findings = [
         finding.model_copy(
             update={
+                "claim_id": claim_aliases.get(finding.claim_id, finding.claim_id),
                 "supporting_evidence_ids": resolve(finding.supporting_evidence_ids),
                 "conflicting_evidence_ids": resolve(finding.conflicting_evidence_ids),
             }
@@ -441,6 +450,61 @@ def _resolve_verification_evidence_aliases(
         for finding in report.findings
     ]
     return report.model_copy(update={"findings": findings})
+
+
+def _enforce_verification_integrity(
+    report: VerificationReport, claims: list[Claim]
+) -> VerificationReport:
+    """Require every finding to name a supplied claim and evidence before verification."""
+
+    claims_by_id = {item.claim_id: item for item in claims}
+    accepted: dict[str, VerificationFinding] = {}
+    for finding in report.findings:
+        claim = claims_by_id.get(finding.claim_id)
+        if claim is None or finding.claim_id in accepted:
+            continue
+        allowed_evidence = set(claim.evidence_ids)
+        supporting = [item for item in finding.supporting_evidence_ids if item in allowed_evidence]
+        conflicting = [
+            item for item in finding.conflicting_evidence_ids if item in allowed_evidence
+        ]
+        status = finding.status
+        explanation = finding.explanation
+        if (
+            status
+            in {
+                VerificationStatus.VERIFIED,
+                VerificationStatus.PARTIALLY_VERIFIED,
+            }
+            and not supporting
+        ):
+            status = VerificationStatus.UNVERIFIED
+            explanation = (
+                "The verifier supplied no valid supporting evidence, so Python downgraded "
+                "this finding to unverified."
+            )
+        elif status == VerificationStatus.CONTRADICTED and not conflicting:
+            status = VerificationStatus.UNVERIFIED
+            explanation = (
+                "The verifier supplied no valid conflicting evidence, so Python downgraded "
+                "this finding to unverified."
+            )
+        accepted[finding.claim_id] = finding.model_copy(
+            update={
+                "status": status,
+                "explanation": explanation,
+                "supporting_evidence_ids": supporting,
+                "conflicting_evidence_ids": conflicting,
+            }
+        )
+    for claim_id in claims_by_id:
+        if claim_id not in accepted:
+            accepted[claim_id] = VerificationFinding(
+                claim_id=claim_id,
+                status=VerificationStatus.UNVERIFIED,
+                explanation="The verifier returned no valid finding for this claim.",
+            )
+    return report.model_copy(update={"findings": list(accepted.values())})
 
 
 async def run_qa(

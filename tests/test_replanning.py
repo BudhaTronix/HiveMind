@@ -6,7 +6,12 @@ from hivemind.config import Settings
 from hivemind.events import EventBus
 from hivemind.providers.fake_provider import FakeLLMProvider
 from hivemind.runtime import HiveMindRuntime
-from hivemind.schemas import EventType, VerificationReport
+from hivemind.schemas import (
+    EventType,
+    VerificationFinding,
+    VerificationReport,
+    VerificationStatus,
+)
 
 
 def settings_for(tmp_path, *, rounds: int = 2) -> Settings:
@@ -69,3 +74,53 @@ async def test_final_report_filters_nonexistent_evidence_ids(tmp_path) -> None:
     assert all(
         source.evidence_id != "evidence_does_not_exist" for source in result.final_report.sources
     )
+
+
+class UnsupportedVerifiedFindingsProvider(FakeLLMProvider):
+    async def generate_structured(
+        self,
+        schema: type[BaseModel],
+        system_prompt: str,
+        user_prompt: str,
+    ) -> BaseModel:
+        result = await super().generate_structured(schema, system_prompt, user_prompt)
+        if schema is VerificationReport:
+            return VerificationReport(
+                findings=[
+                    VerificationFinding(
+                        claim_id="claim_1",
+                        status=VerificationStatus.VERIFIED,
+                        explanation="verified",
+                    )
+                ],
+                summary="A malformed but schema-valid verifier response.",
+            )
+        return result
+
+
+async def test_python_downgrades_unsupported_verification_and_renders_claim_text(
+    tmp_path,
+) -> None:
+    result = await HiveMindRuntime(
+        settings_for(tmp_path, rounds=1),
+        UnsupportedVerifiedFindingsProvider(),
+        EventBus(),
+    ).run("Research a startup market")
+
+    actual_claims = {
+        claim.claim_id: claim.text
+        for report in result.manager_reports
+        for claim in report.merged_claims
+    }
+    assert result.verification.findings
+    assert all(finding.claim_id in actual_claims for finding in result.verification.findings)
+    assert all(
+        finding.status == VerificationStatus.UNVERIFIED for finding in result.verification.findings
+    )
+    assert all(item.startswith("Unverified — ") for item in result.final_report.key_findings)
+    assert any(
+        claim_text in item
+        for item in result.final_report.key_findings
+        for claim_text in actual_claims.values()
+    )
+    assert result.final_report.sources == []

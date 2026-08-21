@@ -79,9 +79,10 @@ Web search only discovers candidate URLs. Python fetches each page through URL v
 converts accepted public text/HTML into a bounded untrusted excerpt, and creates an evidence
 record. Models receive short evidence aliases that Python resolves back to stored IDs, avoiding
 copy errors from long identifiers. Claims refer to those resolved IDs. Before artifacts are
-written, references that do not exist in the run’s evidence set are rejected. Verification
-states remain visible as `verified`,
-`partial`, `uncertain`, or `contradicted`.
+written, references that do not exist in the run’s evidence set are rejected. Python also
+rejects unknown claim IDs and downgrades “verified” findings that contain no valid supporting
+evidence. Final key findings use the real claim text and remain visibly labelled as `verified`,
+`partially verified`, `unverified`, or `contradicted`.
 
 This establishes traceability, not truth. A source can itself be wrong, and a model can
 misinterpret it.
