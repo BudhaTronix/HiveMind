@@ -145,7 +145,7 @@ function edgeList(
   if (view === 'organization') {
     return Object.values(agents).flatMap((agent) => {
       const parentId = agent.profile.parent_agent_id
-      if (!parentId) return []
+      if (!parentId || parentId === agent.profile.agent_id) return []
       const branch = agent.profile.kind === 'manager'
         ? 'manager'
         : agent.profile.kind === 'worker' ? 'worker' : 'support'

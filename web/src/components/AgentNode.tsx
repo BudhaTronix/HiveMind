@@ -23,12 +23,14 @@ const active = new Set([
 export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   const agent = data.state
   const Icon = icons[agent.profile.kind]
+  const receivesSpawnEdge = agent.profile.kind !== 'ceo'
+  const canSpawnChildren = ['ceo', 'manager'].includes(agent.profile.kind)
   return (
     <article
       className={`agent-node role-${agent.profile.kind} status-${agent.status} ${active.has(agent.status) ? 'is-active' : ''} ${data.isNew ? 'is-new' : ''} ${selected ? 'is-selected' : ''}`}
       aria-label={`${agent.profile.name}, ${agent.profile.kind}, ${agent.status}`}
     >
-      <Handle type="target" position={Position.Top} />
+      {receivesSpawnEdge && <Handle type="target" position={Position.Top} />}
       <div className="agent-orb">
         <Icon size={25} aria-hidden="true" />
         <span className={`status-dot status-${agent.status}`} aria-hidden="true" />
@@ -36,7 +38,7 @@ export const AgentNode = memo(function AgentNode({ data, selected }: NodeProps<A
       </div>
       <h3>{agent.profile.name}</h3>
       <span className="node-status">{humanStatus(agent.status)}</span>
-      <Handle type="source" position={Position.Bottom} />
+      {canSpawnChildren && <Handle type="source" position={Position.Bottom} />}
     </article>
   )
 })

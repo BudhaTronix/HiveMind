@@ -371,6 +371,61 @@ def test_snapshot_builder_applies_structured_agent_status(tmp_path: Path) -> Non
     asyncio.run(scenario())
 
 
+def test_snapshot_uses_run_spawn_identity_instead_of_mutable_registry_profile(
+    tmp_path: Path,
+) -> None:
+    repository = HiveMindRepository(tmp_path / "state.sqlite")
+
+    async def scenario() -> None:
+        from hivemind.schemas import RunRecord
+
+        run = RunRecord(
+            project_id="project",
+            prompt="Snapshot identity test",
+            provider="fake",
+            model="simulator",
+        )
+        profile = AgentProfile(
+            project_id="project",
+            role_key="data",
+            name="Data Lead",
+            kind=AgentKind.MANAGER,
+            role_description="Lead research.",
+            parent_agent_id="agent_ceo",
+        )
+        await repository.create_project("project", "project")
+        await repository.save_run(run)
+        await repository.save_agent(profile)
+        await repository.save_event(
+            HiveEvent(
+                event_type=EventType.AGENT_SPAWNED,
+                run_id=run.run_id,
+                agent_id=profile.agent_id,
+                parent_agent_id="agent_ceo",
+                message="Spawned manager",
+                metadata={
+                    "status": "queued",
+                    "name": "Data Lead",
+                    "kind": "manager",
+                    "role_key": "data",
+                },
+            )
+        )
+        profile.name = "Colliding Worker"
+        profile.kind = AgentKind.WORKER
+        profile.parent_agent_id = profile.agent_id
+        await repository.save_agent(profile)
+
+        snapshot = await build_snapshot(repository, run.run_id)
+        assert snapshot is not None
+        restored = snapshot.agents[0].profile
+        assert restored.name == "Data Lead"
+        assert restored.kind == AgentKind.MANAGER
+        assert restored.parent_agent_id == "agent_ceo"
+
+    asyncio.run(scenario())
+
+
 def test_protected_cli_sources_match_recorded_main_hashes() -> None:
     expected = {
         "src/hivemind/cli.py": "378a63f0af65a6693d2e288215e513c581c04c0d2fbd6134f9dacb934fa8a83c",

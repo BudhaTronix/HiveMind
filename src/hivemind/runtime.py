@@ -8,6 +8,7 @@ are gathered individually so one failed worker does not discard successful sibli
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 
 from hivemind.agents import (
@@ -550,6 +551,7 @@ class HiveMindRuntime:
             for item in agents
         )
         counted_agents = len(agents) + max(0, _SUPPORTING_AGENT_RESERVE - supporting)
+        reserved_role_keys = {agent.role_key for agent in agents}
         for department, manager, proposed_workers in zip(
             departments, managers, manager_plan_results, strict=True
         ):
@@ -558,11 +560,17 @@ class HiveMindRuntime:
                 await self._agent_failed(run, manager, str(proposed_workers))
                 teams.append(DepartmentTeam(department, manager, []))
                 continue
+            proposed_workers, role_reductions = _disambiguate_worker_role_keys(
+                proposed_workers,
+                reserved_role_keys=reserved_role_keys,
+            )
             worker_decision = self.governor.validate_worker_plan(
                 proposed_workers, current_organization_agents=counted_agents
             )
             assert isinstance(worker_decision.plan, WorkerPlan)
-            await self._publish_governor_decision(run, worker_decision.reductions)
+            await self._publish_governor_decision(
+                run, (*role_reductions, *worker_decision.reductions)
+            )
             worker_profiles = []
             for spec in worker_decision.plan.workers:
                 profile = await self._profile(
@@ -575,6 +583,7 @@ class HiveMindRuntime:
                     status=AgentStatus.QUEUED,
                 )
                 worker_profiles.append((spec, profile))
+                reserved_role_keys.add(profile.role_key)
             counted_agents += len(worker_profiles)
             agents.extend(profile for _, profile in worker_profiles)
             for spec, profile in worker_profiles:
@@ -1097,10 +1106,11 @@ class HiveMindRuntime:
         worker: AgentProfile,
         task_id: str,
     ) -> list[Evidence]:
-        """Execute only the approved search queries and fetch one top result each."""
+        """Execute approved queries and fetch the first usable result from each."""
 
         collected: list[Evidence] = []
-        for query in spec.search_queries:
+        for proposed_query in spec.search_queries:
+            query = _current_search_query(proposed_query, run.prompt)
             tool_call_id = new_id("toolcall")
             await self.events.emit(
                 EventType.TOOL_STARTED,
@@ -1153,21 +1163,22 @@ class HiveMindRuntime:
                 for result in results
             ]
             collected.extend(query_evidence)
-            if query_evidence:
-                await self._fetch_top_result(run, worker, task_id, query_evidence[0])
+            for candidate in query_evidence[:2]:
+                if await self._fetch_result(run, worker, task_id, candidate):
+                    break
             if self.repository:
                 for item in query_evidence:
                     await self.repository.save_evidence(item)
         return collected
 
-    async def _fetch_top_result(
+    async def _fetch_result(
         self,
         run: RunRecord,
         worker: AgentProfile,
         task_id: str,
         evidence: Evidence,
-    ) -> None:
-        """Enrich one search snippet with a bounded page excerpt when safe and available."""
+    ) -> bool:
+        """Enrich a search result when safe, reporting whether the candidate succeeded."""
 
         assert evidence.url is not None
         tool_call_id = new_id("toolcall")
@@ -1193,7 +1204,7 @@ class HiveMindRuntime:
                 )
         except Exception as exc:  # noqa: BLE001 - the search snippet remains usable evidence.
             await self._tool_failed(run, worker, task_id, tool_call_id, "web_fetch", exc)
-            return
+            return False
         evidence.url = page.url
         evidence.title = page.title or evidence.title
         evidence.content_excerpt = page.excerpt
@@ -1211,6 +1222,7 @@ class HiveMindRuntime:
                 "tool_call_id": tool_call_id,
             },
         )
+        return True
 
     async def _tool_failed(
         self,
@@ -1318,6 +1330,7 @@ class HiveMindRuntime:
             metadata={
                 "name": agent.name,
                 "kind": agent.kind.value,
+                "role_key": agent.role_key,
                 "status": agent.status.value,
             },
         )
@@ -1494,6 +1507,65 @@ def _fallback_manager_report(team: DepartmentTeam, error: str) -> ManagerReport:
         research_gaps=[error[:300]],
         recommended_follow_up=[f"Retry {team.department.name} research."],
     )
+
+
+def _disambiguate_worker_role_keys(
+    plan: WorkerPlan,
+    *,
+    reserved_role_keys: set[str],
+) -> tuple[WorkerPlan, tuple[str, ...]]:
+    """Give every proposed worker a stable, graph-safe role key within this run.
+
+    Smaller local models sometimes reuse a department key for every worker. Reusing that
+    key would cause the registry to turn a manager into its own child, so Python derives a
+    deterministic key from the worker name whenever a collision occurs.
+    """
+
+    used = set(reserved_role_keys)
+    workers: list[WorkerSpec] = []
+    changes = 0
+    for index, worker in enumerate(plan.workers, start=1):
+        role_key = worker.role_key
+        if role_key in used:
+            base = _machine_role_key(worker.name)
+            if not base or base in used:
+                base = f"{plan.department_role_key}-worker-{index}"
+            role_key = base
+            suffix = 2
+            while role_key in used:
+                role_key = f"{base}-{suffix}"
+                suffix += 1
+            worker = worker.model_copy(update={"role_key": role_key})
+            changes += 1
+        used.add(role_key)
+        workers.append(worker)
+    reductions = (
+        (
+            f"Governor repaired {changes} colliding worker role key(s) so every "
+            "manager and worker has a distinct identity."
+        ),
+    ) if changes else ()
+    return plan.model_copy(update={"workers": workers}), reductions
+
+
+def _machine_role_key(name: str) -> str:
+    return re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9]+", "-", name.casefold())).strip("-")
+
+
+def _current_search_query(query: str, prompt: str) -> str:
+    """Correct stale model-supplied years when the user explicitly asks for current data."""
+
+    recency_words = ("latest", "recent", "current", "newest", "today", "up-to-date")
+    if not any(word in prompt.casefold() for word in recency_words):
+        return query
+    year = str(utc_now().year)
+    without_stale_years = re.sub(
+        r"\b20\d{2}(?:\s*[-\u2013/]\s*20\d{2})?\b",
+        "",
+        query,
+    )
+    normalized = " ".join(without_stale_years.split()).strip(" -\u2013/")
+    return f"{normalized} {year}" if normalized else year
 
 
 def _preserve_worker_claims(

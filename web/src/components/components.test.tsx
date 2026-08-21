@@ -27,6 +27,8 @@ describe('interactive dashboard components', () => {
     fireEvent.click(await screen.findByLabelText('Research Worker, worker, completed'))
     expect(selectAgent).toHaveBeenCalledWith('agent_worker')
     expect(screen.queryByText('2 claims')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Research Worker, worker, completed').querySelector('.source')).toBeNull()
+    expect(screen.getByLabelText('CEO Agent, ceo, completed').querySelector('.target')).toBeNull()
     rerender(<GraphCanvas state={state} view="handoffs" onViewChange={() => {}} onSelectAgent={selectAgent} onSelectHandoff={selectHandoff} />)
     fireEvent.click(screen.getByRole('button', { name: 'Open handoff Worker findings' }))
     expect(selectHandoff).toHaveBeenCalledWith('handoff_one')

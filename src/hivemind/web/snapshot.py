@@ -8,6 +8,7 @@ from contextlib import suppress
 
 from hivemind.persistence import HiveMindRepository
 from hivemind.schemas import (
+    AgentKind,
     AgentStatus,
     EventType,
     FinalReport,
@@ -27,19 +28,29 @@ async def build_snapshot(repository: HiveMindRepository, run_id: str) -> RunSnap
     evidence = await repository.list_evidence(run_id)
     tool_activity = await repository.list_tool_calls(run_id)
 
-    member_ids = list(
-        dict.fromkeys(
-            event.agent_id
-            for event in events
-            if event.event_type == EventType.AGENT_SPAWNED and event.agent_id
-        )
-    )
+    spawn_events = {}
+    for event in events:
+        if event.event_type == EventType.AGENT_SPAWNED and event.agent_id:
+            spawn_events.setdefault(event.agent_id, event)
+    member_ids = list(spawn_events)
     profiles = [await repository.get_agent(agent_id) for agent_id in member_ids]
     task_map = _latest_active_tasks(tasks)
     states = []
     for profile in profiles:
         if profile is None:
             continue
+        spawn = spawn_events[profile.agent_id]
+        kind = profile.kind
+        with suppress(ValueError):
+            kind = AgentKind(str(spawn.metadata.get("kind", profile.kind.value)))
+        profile = profile.model_copy(
+            update={
+                "name": str(spawn.metadata.get("name", profile.name)),
+                "role_key": str(spawn.metadata.get("role_key", profile.role_key)),
+                "kind": kind,
+                "parent_agent_id": spawn.parent_agent_id,
+            }
+        )
         related = [event for event in events if event.agent_id == profile.agent_id]
         state = _agent_state(profile.status, related)
         counters = Counter()

@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from hivemind.security import UnsafeUrlError, validate_public_url, wrap_untrusted_content
-from hivemind.tools import ToolError, WebFetchTool
+from hivemind.tools import WebFetchTool
 
 
 async def public_resolver(hostname: str, port: int) -> list[str]:
@@ -77,7 +77,7 @@ async def test_redirect_to_local_network_is_rejected_before_second_request() -> 
     assert requests == 1
 
 
-async def test_fetcher_rejects_large_downloads() -> None:
+async def test_fetcher_keeps_only_a_bounded_prefix_of_large_downloads() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -88,7 +88,8 @@ async def test_fetcher_rejects_large_downloads() -> None:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     fetch = WebFetchTool(client=client, resolver=public_resolver, max_bytes=100)
     try:
-        with pytest.raises(ToolError, match="download-size"):
-            await fetch(url="https://example.com/large")
+        page = await fetch(url="https://example.com/large")
     finally:
         await client.aclose()
+
+    assert page.excerpt == "x" * 100

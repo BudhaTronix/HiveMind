@@ -32,6 +32,18 @@ class AgentRegistry:
         existing = (
             await self.repository.find_agent(project_id, role_key) if self.repository else None
         )
+        if existing and existing.kind != kind:
+            # A model-generated role key is data, not an identity grant. Keep the existing
+            # role intact and deterministically namespace the new kind instead of mutating
+            # (for example) a manager into a worker with the same database ID.
+            base_role_key = f"{role_key}-{kind.value.replace('_', '-')}"
+            role_key = base_role_key
+            suffix = 2
+            existing = await self.repository.find_agent(project_id, role_key)
+            while existing and existing.kind != kind:
+                role_key = f"{base_role_key}-{suffix}"
+                suffix += 1
+                existing = await self.repository.find_agent(project_id, role_key)
         if existing:
             existing.name = name
             existing.kind = kind

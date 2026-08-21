@@ -157,9 +157,12 @@ class WebFetchTool:
                         raise ToolError(f"Unsupported content type: {content_type or 'unknown'}")
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > self.max_bytes:
-                            raise ToolError("Web response exceeded the download-size limit.")
+                        remaining = self.max_bytes - len(body)
+                        if remaining <= 0:
+                            break
+                        body.extend(chunk[:remaining])
+                        if len(chunk) > remaining or len(body) == self.max_bytes:
+                            break
             except httpx.HTTPError as exc:
                 raise ToolError(f"Web fetch failed: {type(exc).__name__}") from exc
             text = bytes(body).decode(response.encoding or "utf-8", errors="replace")

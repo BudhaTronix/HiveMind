@@ -4,8 +4,9 @@ from hivemind.config import Settings
 from hivemind.events import EventBus
 from hivemind.persistence import ArtifactStore, HiveMindRepository, JsonlEventSink
 from hivemind.providers.fake_provider import FakeLLMProvider
+from hivemind.registry import AgentRegistry
 from hivemind.runtime import HiveMindRuntime
-from hivemind.schemas import RunStage
+from hivemind.schemas import AgentKind, RunStage
 
 
 async def test_run_persists_state_events_tasks_and_artifacts(tmp_path) -> None:
@@ -67,3 +68,31 @@ async def test_registry_reuses_stable_project_roles(tmp_path) -> None:
     first_ceo = next(item for item in first.agents if item.role_key == "ceo")
     second_ceo = next(item for item in second.agents if item.role_key == "ceo")
     assert first_ceo.agent_id == second_ceo.agent_id
+
+
+async def test_registry_never_reuses_one_identity_across_agent_kinds(tmp_path) -> None:
+    repository = HiveMindRepository(tmp_path / "hivemind.db")
+    registry = AgentRegistry(repository)
+    manager = await registry.create_or_get(
+        project_id="collision-project",
+        role_key="data",
+        name="Data Lead",
+        kind=AgentKind.MANAGER,
+        role_description="Lead data research.",
+        parent_agent_id="agent_ceo",
+    )
+    worker = await registry.create_or_get(
+        project_id="collision-project",
+        role_key="data",
+        name="Data Collector",
+        kind=AgentKind.WORKER,
+        role_description="Collect source data.",
+        parent_agent_id=manager.agent_id,
+    )
+
+    assert worker.agent_id != manager.agent_id
+    assert worker.role_key == "data-worker"
+    assert worker.parent_agent_id == manager.agent_id
+    saved_manager = await repository.get_agent(manager.agent_id)
+    assert saved_manager is not None
+    assert saved_manager.kind == AgentKind.MANAGER

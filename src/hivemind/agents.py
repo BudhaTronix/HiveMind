@@ -229,7 +229,11 @@ async def run_ceo_planner(
         ceo,
         CompanyPlan,
         CEO_PLAN_SYSTEM,
-        {"prompt": run.prompt, "memories": _memory_text(memories or [])},
+        {
+            "prompt": run.prompt,
+            "current_date": utc_now().date().isoformat(),
+            "memories": _memory_text(memories or []),
+        },
         status=AgentStatus.PLANNING,
     )
 
@@ -273,6 +277,8 @@ async def run_manager_planner(
         MANAGER_PLAN_SYSTEM,
         {
             **department.model_dump(mode="json"),
+            "user_prompt": run.prompt,
+            "current_date": utc_now().date().isoformat(),
             "memories": _memory_text(memories or []),
         },
         status=AgentStatus.PLANNING,
