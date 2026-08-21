@@ -27,7 +27,7 @@ class NewRunRequest(BaseModel):
     project_id: str = Field(default="web-project", min_length=1, max_length=100)
     provider: Literal["fake", "ollama", "openai"] = "fake"
     model: str | None = Field(default=None, min_length=1, max_length=200)
-    enable_web: bool = False
+    enable_web: bool = True
     max_managers: int = Field(default=3, ge=1, le=10)
     max_workers_per_manager: int = Field(default=3, ge=1, le=10)
     max_research_rounds: int = Field(default=2, ge=1, le=5)

@@ -76,6 +76,11 @@ Run deletion is limited to inactive runs. It removes that run's events, tasks, h
 evidence, claims, reports, tool calls, artifact records, and exact artifact directory. Stable
 project-scoped agent identities and curated project memory remain available for future runs.
 
+Safe web research defaults on when Ollama or OpenAI is selected so workers receive external,
+evidence-linked source material. It remains disabled for the synthetic offline provider. Users
+can explicitly turn web research off for a real provider, but the dialog warns that the runtime
+will then return uncertainty rather than treat unsupported model knowledge as evidence.
+
 WebSocket messages use explicit envelopes:
 
 ```json

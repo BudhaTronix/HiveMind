@@ -18,6 +18,7 @@ from hivemind.providers.fake_provider import FakeLLMProvider
 from hivemind.schemas import AgentKind, AgentProfile, EventType, HiveEvent
 from hivemind.web import create_app
 from hivemind.web.broker import LiveBroker
+from hivemind.web.models import NewRunRequest
 from hivemind.web.snapshot import build_snapshot
 
 
@@ -74,6 +75,12 @@ def test_health_and_public_settings_do_not_expose_secrets(tmp_path: Path) -> Non
             json={"prompt": "Unsafe override", "provider": "fake", "api_key": "nope"},
         )
         assert rejected.status_code == 422
+
+
+def test_real_provider_browser_requests_default_to_web_research() -> None:
+    request = NewRunRequest(prompt="Research an evidence-backed answer", provider="ollama")
+
+    assert request.enable_web is True
 
 
 def test_fake_run_schedules_immediately_and_reconstructs_snapshot(tmp_path: Path) -> None:

@@ -18,7 +18,7 @@ from hivemind.web.models import NewRunRequest
 
 
 class PersistentHandoffObserver(RuntimeObserver):
-    """Persist a public handoff before quickly queuing it for live clients."""
+    """Queue a public handoff for live clients, then persist it for reconstruction."""
 
     def __init__(self, repository: HiveMindRepository, broker: LiveBroker) -> None:
         self.repository = repository

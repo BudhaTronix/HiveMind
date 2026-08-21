@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GraphCanvas } from './GraphCanvas'
@@ -9,7 +9,10 @@ import { Timeline } from './Timeline'
 import { dashboardReducer, initialState } from '../state/reducer'
 import { agent, details, event, handoff, snapshot } from '../test/factories'
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+  cleanup()
+  vi.restoreAllMocks()
+})
 
 describe('interactive dashboard components', () => {
   it('clicking a graph node selects it and clicking a handoff edge opens it', async () => {
@@ -50,7 +53,25 @@ describe('interactive dashboard components', () => {
     expect(screen.getByLabelText('Project ID')).toBeEnabled()
     expect(screen.queryByLabelText(/API key/i)).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Start run' }))
-    expect(submit).toHaveBeenCalledWith(expect.objectContaining({ provider: 'fake', prompt: 'Investigate deterministic agents' }))
+    expect(submit).toHaveBeenCalledWith(expect.objectContaining({ provider: 'fake', prompt: 'Investigate deterministic agents', enable_web: false }))
+  })
+
+  it('enables grounded web research by default for real providers', async () => {
+    const submit = vi.fn()
+    render(<NewRunDialog open busy={false} error={null} onClose={() => {}} onSubmit={submit} />)
+    await userEvent.selectOptions(screen.getByLabelText('Provider'), 'ollama')
+    const webResearch = screen.getByRole('checkbox', { name: /Enable safe web research/i })
+    expect(webResearch).toBeChecked()
+    await userEvent.click(webResearch)
+    expect(screen.getByRole('status')).toHaveTextContent(/receive no external evidence/i)
+    await userEvent.click(webResearch)
+    await userEvent.type(screen.getByLabelText('Research prompt'), 'Compare automotive companies')
+    await userEvent.click(screen.getByRole('button', { name: 'Start run' }))
+    expect(submit).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'ollama',
+      prompt: 'Compare automotive companies',
+      enable_web: true,
+    }))
   })
 
   it('collapses the runs sidebar and offers deletion for completed runs', async () => {
