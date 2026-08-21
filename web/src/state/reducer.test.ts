@@ -48,6 +48,19 @@ describe('dashboardReducer', () => {
     expect(Object.keys(state.handoffs)).toEqual(['handoff_one'])
   })
 
+  it('applies a batch of live envelopes in one reducer action', () => {
+    let state = dashboardReducer(initialState, { type: 'snapshot', snapshot: snapshot() })
+    state = dashboardReducer(state, {
+      type: 'envelopes',
+      envelopes: [
+        { type: 'event', data: event() },
+        { type: 'handoff', data: handoff() },
+      ],
+    })
+    expect(state.agents.agent_worker).toBeDefined()
+    expect(state.handoffs.handoff_one).toBeDefined()
+  })
+
   it('replaces from a reconnect snapshot without duplicating records', () => {
     const reconnect = snapshot()
     reconnect.events = [event()]

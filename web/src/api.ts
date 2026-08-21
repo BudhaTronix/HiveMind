@@ -24,6 +24,8 @@ export const api = {
     fetch(`/api/v1/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' }).then((response) => json<{ run_id: string }>(response)),
   cancel: (runId: string) =>
     fetch(`/api/v1/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }).then((response) => json<RunRecord>(response)),
+  deleteRun: (runId: string) =>
+    fetch(`/api/v1/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' }).then((response) => json<{ run_id: string; deleted: boolean }>(response)),
 }
 
 export function streamUrl(runId: string): string {

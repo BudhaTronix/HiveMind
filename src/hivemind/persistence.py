@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,31 @@ class HiveMindRepository:
             "SELECT payload_json FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
         )
         return [RunRecord.model_validate_json(row[0]) for row in rows]
+
+    async def delete_run(self, run_id: str) -> bool:
+        """Delete one run's records while preserving project-scoped agents and memory."""
+
+        await self.initialize()
+        async with aiosqlite.connect(self.path) as db:
+            exists = await db.execute_fetchall(
+                "SELECT 1 FROM runs WHERE run_id = ? LIMIT 1", (run_id,)
+            )
+            if not exists:
+                return False
+            for table in (
+                "tasks",
+                "events",
+                "handoffs",
+                "evidence",
+                "claims",
+                "reports",
+                "artifacts",
+                "tool_calls",
+            ):
+                await db.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+            await db.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+            await db.commit()
+            return True
 
     async def save_agent(self, agent: AgentProfile) -> None:
         await self.initialize()
@@ -638,6 +664,16 @@ class ArtifactStore:
 
     def run_dir(self, run_id: str) -> Path:
         return self.runs_dir / run_id
+
+    async def delete_run(self, run_id: str) -> None:
+        """Remove only the exact run artifact directory, never the runs root."""
+
+        root = self.runs_dir.resolve()
+        target = (root / run_id).resolve()
+        if target.parent != root:
+            raise ValueError("Invalid run artifact path.")
+        if target.is_dir():
+            await asyncio.to_thread(shutil.rmtree, target)
 
     async def prepare(self, run: RunRecord) -> Path:
         directory = self.run_dir(run.run_id)

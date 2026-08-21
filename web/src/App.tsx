@@ -1,10 +1,11 @@
 import { Component, useEffect, useReducer, useState, type ErrorInfo, type ReactNode } from 'react'
-import { Activity, BrainCircuit, CircleStop, FileText, Moon, Network, Play, Plus, RefreshCw, Sun, Wifi, WifiOff } from 'lucide-react'
+import { Activity, CircleStop, FileText, Moon, Network, Play, RefreshCw, Sun, Wifi, WifiOff } from 'lucide-react'
 import { api } from './api'
 import { FinalReportView } from './components/FinalReportView'
 import { GraphCanvas } from './components/GraphCanvas'
 import { Inspector } from './components/Inspector'
 import { NewRunDialog } from './components/NewRunDialog'
+import { RunSidebar } from './components/RunSidebar'
 import { Timeline } from './components/Timeline'
 import { useRunStream } from './hooks/useRunStream'
 import { dashboardReducer, initialState } from './state/reducer'
@@ -21,6 +22,8 @@ export default function App() {
   const [view, setView] = useState<'organization' | 'handoffs'>('organization')
   const [theme, setTheme] = useState<'dark' | 'light'>(() => localStorage.getItem('hivemind-theme') === 'light' ? 'light' : 'dark')
   const [reportOpen, setReportOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('hivemind-sidebar') === 'collapsed')
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null)
   const elapsed = useElapsed(state.run?.created_at)
 
   useRunStream(currentRunId, dispatch)
@@ -73,11 +76,47 @@ export default function App() {
     setActionError(null)
     try { await api.cancel(currentRunId) } catch (error) { setActionError(error instanceof Error ? error.message : 'Cancellation failed.') }
   }
+  const deleteRun = async (run: RunRecord) => {
+    const confirmed = window.confirm(
+      `Delete this run and its saved artifacts?\n\n${run.prompt}\n\nThis cannot be undone.`,
+    )
+    if (!confirmed) return
+    setDeletingRunId(run.run_id)
+    setActionError(null)
+    try {
+      await api.deleteRun(run.run_id)
+      const remaining = await api.listRuns()
+      setRuns(remaining)
+      if (currentRunId === run.run_id) {
+        dispatch({ type: 'reset' })
+        setCurrentRunId(remaining[0]?.run_id ?? null)
+      }
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Run deletion failed.')
+    } finally {
+      setDeletingRunId(null)
+    }
+  }
+  const toggleSidebar = () => {
+    setSidebarCollapsed((value) => {
+      localStorage.setItem('hivemind-sidebar', value ? 'expanded' : 'collapsed')
+      return !value
+    })
+  }
   const terminal = state.run && ['completed', 'failed', 'cancelled'].includes(state.run.stage)
   const selected = state.selectedAgentId || state.selectedHandoffId
 
-  return <div className="app-shell">
-    <aside className="run-sidebar"><div className="brand"><span><BrainCircuit size={21} /></span><div><strong>HiveMind</strong><small>Agent canvas</small></div></div><button className="new-run-button" onClick={() => { setActionError(null); setDialogOpen(true) }}><Plus size={17} /> New Run</button><div className="sidebar-label">Recent runs</div><nav aria-label="Historical runs">{runs.map((run) => <button key={run.run_id} className={`run-list-item ${currentRunId === run.run_id ? 'active' : ''}`} onClick={() => setCurrentRunId(run.run_id)}><span className={`run-state stage-${run.stage}`} /><span><strong>{run.prompt}</strong><small>{run.provider} · {new Date(run.created_at).toLocaleDateString()}</small></span></button>)}</nav><footer><Network size={14} /><span>Local observability</span></footer></aside>
+  return <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+    <RunSidebar
+      runs={runs}
+      currentRunId={currentRunId}
+      collapsed={sidebarCollapsed}
+      deletingRunId={deletingRunId}
+      onToggle={toggleSidebar}
+      onNew={() => { setActionError(null); setDialogOpen(true) }}
+      onSelect={setCurrentRunId}
+      onDelete={(run) => void deleteRun(run)}
+    />
     <main className="workspace">
       <header className="topbar"><div className="run-context"><span className="eyebrow">{state.run?.project_id ?? 'No project'}</span><h1>{state.run?.prompt ?? 'HiveMind workflow canvas'}</h1></div>{state.run && <div className="run-facts"><span><Activity size={14} /> {state.run.stage.replaceAll('_', ' ')}</span><span>Round {state.run.round_number}/{state.run.max_rounds}</span><span>{elapsed}</span><span>{state.run.provider} · {state.run.model}</span></div>}<div className="top-actions"><label className="follow-toggle"><input type="checkbox" checked={state.followLive} onChange={(event) => dispatch({ type: 'set_follow_live', enabled: event.target.checked })} /> Follow Live</label><span className={`connection connection-${state.connection}`} title={`WebSocket ${state.connection}`}>{state.connection === 'live' ? <Wifi size={15} /> : <WifiOff size={15} />}{state.connection}</span>{state.finalReport && <button className="toolbar-button" onClick={() => setReportOpen(true)}><FileText size={15} /> Report</button>}{state.run && !terminal && <button className="icon-button danger" aria-label="Cancel active run" title="Cancel run" onClick={() => void cancel()}><CircleStop size={17} /></button>}{state.run && terminal && state.run.stage !== 'completed' && <button className="toolbar-button" onClick={() => void resume()}><RefreshCw size={15} /> Resume</button>}<button className="icon-button" aria-label={`Use ${theme === 'dark' ? 'light' : 'dark'} theme`} onClick={() => setTheme((value) => value === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}</button></div></header>
       {actionError && <div className="error-banner" role="alert"><strong>Setup or provider issue</strong><span>{actionError}</span><button aria-label="Dismiss error" onClick={() => setActionError(null)}>×</button></div>}

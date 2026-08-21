@@ -25,8 +25,8 @@ class PersistentHandoffObserver(RuntimeObserver):
         self.broker = broker
 
     async def publish_handoff(self, handoff: AgentHandoff) -> None:
-        await self.repository.save_handoff(handoff)
         await self.broker.publish_handoff(handoff)
+        await self.repository.save_handoff(handoff)
 
 
 class RunSupervisor:
@@ -87,6 +87,16 @@ class RunSupervisor:
         await asyncio.gather(task, return_exceptions=True)
         return await self.repository.get_run(run_id) or run
 
+    async def delete(self, run_id: str) -> None:
+        run = await self.repository.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        if self.is_active(run_id):
+            raise RuntimeError("Active runs must be cancelled before deletion.")
+        await self.artifacts.delete_run(run_id)
+        if not await self.repository.delete_run(run_id):
+            raise KeyError(run_id)
+
     def is_active(self, run_id: str) -> bool:
         task = self._tasks.get(run_id)
         return bool(task and not task.done())
@@ -100,9 +110,12 @@ class RunSupervisor:
 
     def _runtime(self, settings: Settings, provider: Any) -> HiveMindRuntime:
         events = EventBus()
+        # The broker only performs a bounded put_nowait, so live clients see the state
+        # change before slower SQLite and filesystem persistence completes. Its
+        # subscribe-before-snapshot protocol buffers this safely during reconnects.
+        events.subscribe(self.broker.event_sink)
         events.subscribe(self.repository.save_event)
         events.subscribe(JsonlEventSink(self.artifacts))
-        events.subscribe(self.broker.event_sink)
         return HiveMindRuntime(
             settings,
             provider,

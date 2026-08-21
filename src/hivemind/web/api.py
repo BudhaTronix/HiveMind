@@ -85,6 +85,17 @@ async def cancel_run(run_id: str, request: Request) -> dict:
     return run.model_dump(mode="json")
 
 
+@router.delete("/runs/{run_id}")
+async def delete_run(run_id: str, request: Request) -> dict[str, object]:
+    try:
+        await request.app.state.supervisor.delete(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Run not found.") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"run_id": run_id, "deleted": True}
+
+
 @router.websocket("/runs/{run_id}/stream")
 async def stream(run_id: str, websocket: WebSocket) -> None:
     repository = websocket.app.state.repository

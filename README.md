@@ -116,7 +116,8 @@ a prompt. Provider-specific code is isolated in `src/hivemind/providers/`.
 The browser dashboard is a second interface; it does not replace or alter any `hivemind`
 command. It shows the organization and actual public agent-to-agent handoffs as a live,
 interactive graph. Node dragging changes only your local presentation—not the runtime plan,
-hierarchy, or permissions.
+hierarchy, or permissions. The run sidebar can be collapsed; completed, failed, and cancelled
+runs can be removed from its trash action after confirmation.
 
 Prerequisites are Python 3.11+ and Node.js 20 or 22+. Install the optional server dependencies
 and frontend packages:

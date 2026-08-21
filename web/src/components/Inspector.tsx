@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ArrowDownLeft, ArrowUpRight, ExternalLink, PinOff, X } from 'lucide-react'
 import { api } from '../api'
 import type { DashboardState } from '../state/reducer'
@@ -17,22 +17,37 @@ export function Inspector({ state, runId, onClose, onSelectAgent }: Props) {
   const [details, setDetails] = useState<AgentDetails | null>(null)
   const [loading, setLoading] = useState(false)
   const [tab, setTab] = useState<Tab>('overview')
+  const loadedAgentId = useRef<string | null>(null)
   const handoff = state.selectedHandoffId ? state.handoffs[state.selectedHandoffId] : null
   const agentId = state.selectedAgentId
+  const detailRevision = agentId ? [
+    state.agents[agentId]?.last_activity_at ?? '',
+    Object.values(state.handoffs).filter((item) =>
+      item.source_agent_id === agentId || item.target_agent_id === agentId).length,
+    state.tasks.filter((task) => task.agent_id === agentId)
+      .map((task) => `${task.task_id}:${task.status}`).join(','),
+  ].join(':') : ''
 
   useEffect(() => {
     if (!agentId) return
     let current = true
-    setLoading(true)
-    void api.agent(runId, agentId).then((value) => {
-      if (current) setDetails(value)
-    }).catch(() => {
-      if (current) setDetails(null)
-    }).finally(() => {
-      if (current) setLoading(false)
-    })
-    return () => { current = false }
-  }, [agentId, runId, state.events.length, state.handoffs])
+    const changingAgent = loadedAgentId.current !== agentId
+    if (changingAgent) {
+      loadedAgentId.current = agentId
+      setDetails(null)
+      setLoading(true)
+    }
+    const timer = window.setTimeout(() => {
+      void api.agent(runId, agentId).then((value) => {
+        if (current) setDetails(value)
+      }).catch(() => {
+        if (current) setDetails(null)
+      }).finally(() => {
+        if (current) setLoading(false)
+      })
+    }, changingAgent ? 0 : 120)
+    return () => { current = false; window.clearTimeout(timer) }
+  }, [agentId, detailRevision, runId])
 
   if (!handoff && !agentId) return null
   return (

@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react'
 import { ChevronDown, ChevronUp, Radio, RotateCcw } from 'lucide-react'
 import type { DashboardState } from '../state/reducer'
 
+const MAX_VISIBLE_ITEMS = 300
+
 interface Props {
   state: DashboardState
   onFocusAgent: (agentId: string) => void
@@ -20,7 +22,7 @@ export function Timeline({ state, onFocusAgent, onFocusHandoff }: Props) {
   ].sort((a, b) => a.time.localeCompare(b.time)).filter((item) =>
     (agentFilter === 'all' || item.agentId === agentFilter) &&
     (typeFilter === 'all' || item.kind === typeFilter) &&
-    (severity === 'all' || item.severity === severity)), [agentFilter, severity, state.events, state.handoffs, typeFilter])
+    (severity === 'all' || item.severity === severity)).slice(-MAX_VISIBLE_ITEMS), [agentFilter, severity, state.events, state.handoffs, typeFilter])
 
   return <section className={`timeline ${open ? 'open' : ''}`} aria-label="Run event timeline">
     <header><button className="timeline-title" onClick={() => setOpen((value) => !value)} aria-expanded={open}>{open ? <ChevronDown size={16} /> : <ChevronUp size={16} />}<Radio size={15} /> Timeline <span>{items.length}</span></button>{open && <div className="timeline-filters"><select aria-label="Timeline agent filter" value={agentFilter} onChange={(event) => setAgentFilter(event.target.value)}><option value="all">All agents</option>{Object.values(state.agents).map((agent) => <option key={agent.profile.agent_id} value={agent.profile.agent_id}>{agent.profile.name}</option>)}</select><select aria-label="Timeline item type" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}><option value="all">Events + handoffs</option><option value="event">Events</option><option value="handoff">Handoffs</option></select><select aria-label="Timeline severity" value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severity</option><option value="info">Info</option><option value="warning">Warning</option><option value="error">Error</option></select>{paused && <button className="resume-live" onClick={() => setPaused(false)}><RotateCcw size={14} /> Resume Live</button>}</div>}</header>

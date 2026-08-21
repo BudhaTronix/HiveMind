@@ -59,6 +59,7 @@ GET  /api/v1/health
 GET  /api/v1/public-settings
 GET  /api/v1/runs
 POST /api/v1/runs
+DELETE /api/v1/runs/{run_id}
 GET  /api/v1/runs/{run_id}/snapshot
 GET  /api/v1/runs/{run_id}/agents/{agent_id}
 POST /api/v1/runs/{run_id}/resume
@@ -70,6 +71,10 @@ New-run JSON uses a forbidden-extra-fields model. Only prompt, project, selected
 web enablement, and bounded team/round/concurrency controls are accepted. Database paths,
 artifact paths, API keys, base URLs, and unknown settings are rejected. Public settings never
 return credentials or server paths.
+
+Run deletion is limited to inactive runs. It removes that run's events, tasks, handoffs,
+evidence, claims, reports, tool calls, artifact records, and exact artifact directory. Stable
+project-scoped agent identities and curated project memory remain available for future runs.
 
 WebSocket messages use explicit envelopes:
 
@@ -151,6 +156,8 @@ npm ci
 
 Backend tests use temporary SQLite databases and the fake provider. They cover scheduling,
 snapshots, selected-agent joins, redaction and bounds, handoff deduplication, resume, WebSocket
-ordering, slow clients, cancellation, and additive v1 upgrades. Frontend tests cover reducer
+ordering, slow clients, cancellation, deletion, and additive v1 upgrades. Frontend tests cover reducer
 reconstruction and deduplication, live spawn/follow/pinning behavior, structured status, graph
-selection, message inspection, edge selection, and keyboard-accessible safe controls.
+selection, message inspection, edge selection, sidebar controls, and keyboard-accessible safe
+controls. Live envelopes are applied in short batches, Dagre reruns only when graph topology
+changes, and selected-agent refetches are scoped and debounced.

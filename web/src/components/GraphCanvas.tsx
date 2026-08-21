@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import dagre from '@dagrejs/dagre'
 import {
   Background, BackgroundVariant, Controls, MiniMap, ReactFlow, ReactFlowProvider,
@@ -32,6 +32,7 @@ function Canvas({ state, view, onViewChange, onSelectAgent, onSelectHandoff }: P
   const [roleFilter, setRoleFilter] = useState<AgentKind | 'all'>('all')
   const [locked, setLocked] = useState(false)
   const [nodes, setNodes] = useState<AgentFlowNode[]>([])
+  const layoutCache = useRef<{ key: string; positions: Record<string, { x: number; y: number }> }>({ key: '', positions: {} })
   const { fitView, setCenter } = useReactFlow()
 
   const visibleAgents = useMemo(() => Object.values(state.agents).filter((agent) => {
@@ -40,19 +41,37 @@ function Canvas({ state, view, onViewChange, onSelectAgent, onSelectHandoff }: P
       (roleFilter === 'all' || agent.profile.kind === roleFilter)
   }), [query, roleFilter, state.agents, statusFilter])
 
-  const calculated = useMemo(
-    () => layoutNodes(visibleAgents.map((agent) => ({
+  const rawEdges = useMemo(
+    () => edgeList(state.agents, state.handoffs, view),
+    [state.agents, state.handoffs, view],
+  )
+  const topologyKey = `${view}:${visibleAgents.map((agent) => agent.profile.agent_id).join(',')}:${rawEdges.map((edge) => `${edge.source}>${edge.target}`).join(',')}`
+  if (layoutCache.current.key !== topologyKey) {
+    layoutCache.current = {
+      key: topologyKey,
+      positions: layoutPositions(
+        visibleAgents.map((agent) => agent.profile.agent_id),
+        rawEdges,
+        view,
+      ),
+    }
+  }
+  const positions = layoutCache.current.positions
+  const calculated = useMemo(() => visibleAgents.map((agent) => ({
       id: agent.profile.agent_id,
       type: 'agent' as const,
-      position: { x: 0, y: 0 },
+      position: positions[agent.profile.agent_id] ?? { x: 0, y: 0 },
       data: { state: agent, isNew: state.newestAgentId === agent.profile.agent_id },
-    })), edgeList(state, view), view),
-    [state, view, visibleAgents],
-  )
+    })), [positions, state.newestAgentId, visibleAgents])
 
   useEffect(() => {
     setNodes((previous) => calculated.map((node) => {
       const existing = previous.find((item) => item.id === node.id)
+      if (
+        existing &&
+        existing.data.state === node.data.state &&
+        existing.data.isNew === node.data.isNew
+      ) return existing
       return existing ? { ...node, position: existing.position, selected: existing.selected } : node
     }))
   }, [calculated])
@@ -60,11 +79,11 @@ function Canvas({ state, view, onViewChange, onSelectAgent, onSelectHandoff }: P
   useEffect(() => {
     if (!state.followLive || !state.newestAgentId) return
     const node = nodes.find((item) => item.id === state.newestAgentId)
-    if (node) void setCenter(node.position.x + 140, node.position.y + 65, { zoom: 1, duration: 500 })
+    if (node) void setCenter(node.position.x + 56, node.position.y + 46, { zoom: 1, duration: 350 })
   }, [nodes, setCenter, state.followLive, state.newestAgentId])
 
-  const edges = useMemo(() => edgeList(state, view).filter((edge) =>
-    nodes.some((node) => node.id === edge.source) && nodes.some((node) => node.id === edge.target)), [nodes, state, view])
+  const edges = useMemo(() => rawEdges.filter((edge) =>
+    nodes.some((node) => node.id === edge.source) && nodes.some((node) => node.id === edge.target)), [nodes, rawEdges])
   const resetLayout = useCallback(() => {
     setNodes(calculated)
     window.setTimeout(() => void fitView({ padding: 0.18, duration: 400 }), 0)
@@ -105,9 +124,13 @@ function Canvas({ state, view, onViewChange, onSelectAgent, onSelectHandoff }: P
   )
 }
 
-function edgeList(state: DashboardState, view: 'organization' | 'handoffs'): Edge[] {
+function edgeList(
+  agents: DashboardState['agents'],
+  handoffs: DashboardState['handoffs'],
+  view: 'organization' | 'handoffs',
+): Edge[] {
   if (view === 'organization') {
-    return Object.values(state.agents).flatMap((agent) => agent.profile.parent_agent_id ? [{
+    return Object.values(agents).flatMap((agent) => agent.profile.parent_agent_id ? [{
       id: `org:${agent.profile.parent_agent_id}:${agent.profile.agent_id}`,
       source: agent.profile.parent_agent_id,
       target: agent.profile.agent_id,
@@ -115,7 +138,7 @@ function edgeList(state: DashboardState, view: 'organization' | 'handoffs'): Edg
       className: 'organization-edge',
     }] : [])
   }
-  return Object.values(state.handoffs).map((handoff) => ({
+  return Object.values(handoffs).map((handoff) => ({
     id: handoff.handoff_id,
     source: handoff.source_agent_id,
     target: handoff.target_agent_id,
@@ -128,16 +151,20 @@ function edgeList(state: DashboardState, view: 'organization' | 'handoffs'): Edg
   }))
 }
 
-function layoutNodes(nodes: AgentFlowNode[], edges: Edge[], view: string): AgentFlowNode[] {
+function layoutPositions(
+  agentIds: string[],
+  edges: Edge[],
+  view: string,
+): Record<string, { x: number; y: number }> {
   const graph = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}))
-  graph.setGraph({ rankdir: view === 'organization' ? 'TB' : 'LR', ranksep: 90, nodesep: 48 })
-  nodes.forEach((node) => graph.setNode(node.id, { width: 280, height: 132 }))
+  graph.setGraph({ rankdir: view === 'organization' ? 'TB' : 'LR', ranksep: 64, nodesep: 30 })
+  agentIds.forEach((agentId) => graph.setNode(agentId, { width: 112, height: 92 }))
   edges.forEach((edge) => graph.setEdge(edge.source, edge.target))
   dagre.layout(graph)
-  return nodes.map((node) => {
-    const position = graph.node(node.id) as { x: number; y: number } | undefined
-    return { ...node, position: position ? { x: position.x - 140, y: position.y - 66 } : node.position }
-  })
+  return Object.fromEntries(agentIds.map((agentId) => {
+    const position = graph.node(agentId) as { x: number; y: number } | undefined
+    return [agentId, position ? { x: position.x - 56, y: position.y - 46 } : { x: 0, y: 0 }]
+  }))
 }
 
 function roleColor(kind?: AgentKind): string {

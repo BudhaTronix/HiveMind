@@ -192,6 +192,30 @@ def test_completed_resume_does_not_duplicate_handoffs(tmp_path: Path) -> None:
         }
 
 
+def test_delete_old_run_removes_records_and_artifacts_but_keeps_agents(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    repository = HiveMindRepository(settings.db_path)
+    with TestClient(create_app(settings=settings, repository=repository)) as client:
+        run_id = schedule_fake(client)
+        snapshot = wait_for_terminal(client, run_id)
+        participating_ids = {
+            item["profile"]["agent_id"] for item in snapshot["agents"]
+        }
+        artifact_dir = settings.runs_dir / run_id
+        assert artifact_dir.is_dir()
+
+        response = client.delete(f"/api/v1/runs/{run_id}")
+
+        assert response.status_code == 200
+        assert response.json() == {"run_id": run_id, "deleted": True}
+        assert client.get(f"/api/v1/runs/{run_id}/snapshot").status_code == 404
+        assert not artifact_dir.exists()
+        stable_ids = {
+            item.agent_id for item in asyncio.run(repository.list_agents("web-tests"))
+        }
+        assert participating_ids <= stable_ids
+
+
 def test_websocket_sends_snapshot_before_buffered_live_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -258,6 +282,7 @@ def test_cancel_marks_an_active_run_cancelled(
             if stage != "created":
                 break
             time.sleep(0.01)
+        assert client.delete(f"/api/v1/runs/{run_id}").status_code == 409
         response = client.post(f"/api/v1/runs/{run_id}/cancel")
         assert response.status_code == 200
         assert response.json()["stage"] == "cancelled"

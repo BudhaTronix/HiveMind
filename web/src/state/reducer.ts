@@ -52,6 +52,8 @@ export const initialState: DashboardState = {
 export type DashboardAction =
   | { type: 'snapshot'; snapshot: RunSnapshot; reconnect?: boolean }
   | { type: 'envelope'; envelope: StreamEnvelope }
+  | { type: 'envelopes'; envelopes: StreamEnvelope[] }
+  | { type: 'reset' }
   | { type: 'select_agent'; agentId: string; pinned?: boolean }
   | { type: 'select_handoff'; handoffId: string }
   | { type: 'clear_selection' }
@@ -67,6 +69,14 @@ export function dashboardReducer(
       return fromSnapshot(state, action.snapshot, Boolean(action.reconnect))
     case 'envelope':
       return applyEnvelope(state, action.envelope)
+    case 'envelopes':
+      return action.envelopes.reduce(applyEnvelope, state)
+    case 'reset':
+      return {
+        ...initialState,
+        followLive: state.followLive,
+        connection: state.connection,
+      }
     case 'select_agent':
       return {
         ...state,
