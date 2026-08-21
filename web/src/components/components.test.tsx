@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { organizationLayoutPositions } from '../graphLayout'
 import { GraphCanvas } from './GraphCanvas'
 import { Inspector } from './Inspector'
 import { NewRunDialog } from './NewRunDialog'
@@ -29,6 +30,29 @@ describe('interactive dashboard components', () => {
     rerender(<GraphCanvas state={state} view="handoffs" onViewChange={() => {}} onSelectAgent={selectAgent} onSelectHandoff={selectHandoff} />)
     fireEvent.click(screen.getByRole('button', { name: 'Open handoff Worker findings' }))
     expect(selectHandoff).toHaveBeenCalledWith('handoff_one')
+  })
+
+  it('lays out organization ownership as a CEO-manager-worker pyramid', () => {
+    const agents = [
+      agent(),
+      agent('manager_a', 'manager', 'agent_ceo'),
+      agent('manager_b', 'manager', 'agent_ceo'),
+      agent('worker_a1', 'worker', 'manager_a'),
+      agent('worker_a2', 'worker', 'manager_a'),
+      agent('worker_b1', 'worker', 'manager_b'),
+      agent('verifier', 'verifier', 'agent_ceo'),
+    ]
+    const positions = organizationLayoutPositions(agents)
+    const center = (id: string) => positions[id].x + 56
+
+    expect(positions.agent_ceo.y).toBeLessThan(positions.manager_a.y)
+    expect(positions.manager_a.y).toBe(positions.manager_b.y)
+    expect(positions.manager_a.y).toBeLessThan(positions.worker_a1.y)
+    expect(center('manager_a')).toBe((center('worker_a1') + center('worker_a2')) / 2)
+    expect(center('agent_ceo')).toBeGreaterThan(center('manager_a'))
+    expect(center('agent_ceo')).toBeLessThan(center('manager_b'))
+    expect(positions.verifier.x).toBeGreaterThan(positions.worker_b1.x)
+    expect(positions.verifier.y).toBe(positions.manager_a.y)
   })
 
   it('an agent inspector exposes status plus incoming and outgoing public messages', async () => {

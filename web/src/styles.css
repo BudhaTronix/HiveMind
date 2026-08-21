@@ -127,7 +127,8 @@ button { color: inherit; }
 .react-flow__controls-button { color: var(--text); border-color: var(--line) !important; background: var(--surface) !important; fill: currentColor !important; }
 .react-flow__minimap { overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--surface) !important; }
 .react-flow__edge-path { stroke: var(--line-strong); stroke-width: 1.6; }
-.react-flow__edge.organization-edge .react-flow__edge-path { stroke-dasharray: 4 4; }
+.react-flow__edge.organization-edge .react-flow__edge-path { stroke-linecap: round; stroke-width: 1.8; }
+.react-flow__edge.organization-edge.support-branch .react-flow__edge-path { stroke-dasharray: 5 5; }
 .react-flow__edge.handoff-edge .react-flow__edge-path { stroke: color-mix(in srgb, var(--accent) 55%, #7583aa); }
 .react-flow__edge.selected .react-flow__edge-path { stroke: var(--accent); stroke-width: 2.5; }
 .react-flow__edge-text { fill: var(--muted); font-size: 9px; }

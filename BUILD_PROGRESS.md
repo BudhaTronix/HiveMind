@@ -19,7 +19,7 @@ committed and pushed before work continues.
 - [x] Cover browser APIs, reconnect state, safety, and frontend interactions.
 - [x] Document and validate the local browser dashboard.
 
-Final acceptance baseline: 64 deterministic Python tests, 14 frontend tests, 10 offline
+Final acceptance baseline: 64 deterministic Python tests, 15 frontend tests, 10 offline
 evaluation scenarios, Ruff and ESLint, a strict TypeScript production build, an offline CLI and
 browser demo, persisted graph reconstruction, resume deduplication, command help, and provider
 diagnostics.

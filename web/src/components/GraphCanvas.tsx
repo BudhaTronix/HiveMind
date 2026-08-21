@@ -2,12 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import dagre from '@dagrejs/dagre'
 import {
   Background, BackgroundVariant, Controls, MiniMap, ReactFlow, ReactFlowProvider,
-  applyNodeChanges, useReactFlow, type Edge, type NodeChange,
+  MarkerType, applyNodeChanges, useReactFlow, type Edge, type NodeChange,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { Filter, LocateFixed, Lock, Search, Unlock } from 'lucide-react'
 import type { DashboardState } from '../state/reducer'
-import type { AgentKind, AgentStatus } from '../types'
+import type { AgentKind, AgentNodeState, AgentStatus } from '../types'
+import {
+  GRAPH_NODE_HEIGHT as NODE_HEIGHT,
+  GRAPH_NODE_WIDTH as NODE_WIDTH,
+  organizationLayoutPositions,
+} from '../graphLayout'
 import { AgentNode, type AgentFlowNode } from './AgentNode'
 
 interface Props {
@@ -33,6 +38,7 @@ function Canvas({ state, view, onViewChange, onSelectAgent, onSelectHandoff }: P
   const [locked, setLocked] = useState(false)
   const [nodes, setNodes] = useState<AgentFlowNode[]>([])
   const layoutCache = useRef<{ key: string; positions: Record<string, { x: number; y: number }> }>({ key: '', positions: {} })
+  const appliedTopologyKey = useRef('')
   const { fitView, setCenter } = useReactFlow()
 
   const visibleAgents = useMemo(() => Object.values(state.agents).filter((agent) => {
@@ -50,7 +56,7 @@ function Canvas({ state, view, onViewChange, onSelectAgent, onSelectHandoff }: P
     layoutCache.current = {
       key: topologyKey,
       positions: layoutPositions(
-        visibleAgents.map((agent) => agent.profile.agent_id),
+        visibleAgents,
         rawEdges,
         view,
       ),
@@ -65,16 +71,23 @@ function Canvas({ state, view, onViewChange, onSelectAgent, onSelectHandoff }: P
     })), [positions, state.newestAgentId, visibleAgents])
 
   useEffect(() => {
+    const topologyChanged = appliedTopologyKey.current !== topologyKey
+    appliedTopologyKey.current = topologyKey
     setNodes((previous) => calculated.map((node) => {
       const existing = previous.find((item) => item.id === node.id)
       if (
         existing &&
+        !topologyChanged &&
         existing.data.state === node.data.state &&
         existing.data.isNew === node.data.isNew
       ) return existing
-      return existing ? { ...node, position: existing.position, selected: existing.selected } : node
+      return existing ? {
+        ...node,
+        position: topologyChanged ? node.position : existing.position,
+        selected: existing.selected,
+      } : node
     }))
-  }, [calculated])
+  }, [calculated, topologyKey])
 
   useEffect(() => {
     if (!state.followLive || !state.newestAgentId) return
@@ -130,13 +143,24 @@ function edgeList(
   view: 'organization' | 'handoffs',
 ): Edge[] {
   if (view === 'organization') {
-    return Object.values(agents).flatMap((agent) => agent.profile.parent_agent_id ? [{
-      id: `org:${agent.profile.parent_agent_id}:${agent.profile.agent_id}`,
-      source: agent.profile.parent_agent_id,
-      target: agent.profile.agent_id,
-      type: 'smoothstep',
-      className: 'organization-edge',
-    }] : [])
+    return Object.values(agents).flatMap((agent) => {
+      const parentId = agent.profile.parent_agent_id
+      if (!parentId) return []
+      const branch = agent.profile.kind === 'manager'
+        ? 'manager'
+        : agent.profile.kind === 'worker' ? 'worker' : 'support'
+      const color = branch === 'manager' ? '#8f79d4' : branch === 'worker' ? '#3fb69e' : '#647087'
+      return [{
+        id: `org:${parentId}:${agent.profile.agent_id}`,
+        source: parentId,
+        target: agent.profile.agent_id,
+        type: 'smoothstep',
+        className: `organization-edge ${branch}-branch`,
+        ariaLabel: `${agents[parentId]?.profile.name ?? 'Parent agent'} spawned ${agent.profile.name}`,
+        markerEnd: { type: MarkerType.ArrowClosed, color, width: 14, height: 14 },
+        style: { stroke: color },
+      }]
+    })
   }
   return Object.values(handoffs).map((handoff) => ({
     id: handoff.handoff_id,
@@ -152,18 +176,23 @@ function edgeList(
 }
 
 function layoutPositions(
-  agentIds: string[],
+  agents: AgentNodeState[],
   edges: Edge[],
   view: string,
 ): Record<string, { x: number; y: number }> {
+  if (view === 'organization') return organizationLayoutPositions(agents)
   const graph = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}))
-  graph.setGraph({ rankdir: view === 'organization' ? 'TB' : 'LR', ranksep: 64, nodesep: 30 })
-  agentIds.forEach((agentId) => graph.setNode(agentId, { width: 112, height: 92 }))
+  const agentIds = agents.map((agent) => agent.profile.agent_id)
+  graph.setGraph({ rankdir: 'LR', ranksep: 64, nodesep: 30 })
+  agentIds.forEach((agentId) => graph.setNode(agentId, { width: NODE_WIDTH, height: NODE_HEIGHT }))
   edges.forEach((edge) => graph.setEdge(edge.source, edge.target))
   dagre.layout(graph)
   return Object.fromEntries(agentIds.map((agentId) => {
     const position = graph.node(agentId) as { x: number; y: number } | undefined
-    return [agentId, position ? { x: position.x - 56, y: position.y - 46 } : { x: 0, y: 0 }]
+    return [agentId, position ? {
+      x: position.x - NODE_WIDTH / 2,
+      y: position.y - NODE_HEIGHT / 2,
+    } : { x: 0, y: 0 }]
   }))
 }
 

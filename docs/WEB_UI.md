@@ -171,3 +171,10 @@ The timeline uses a horizontally scrollable card-and-marker track. Cards alterna
 time axis, keep the latest activity in view until the user scrolls back, and retain the existing
 agent, type, and severity filters. Collapsing it leaves only a compact bottom bar so the workflow
 canvas immediately receives the released vertical space.
+
+Organization view uses a deterministic ownership layout rather than a generic graph ranking:
+the CEO is centered at the apex, managers occupy the second level, and every worker is centered
+inside its manager's subtree. Verifier, QA, and memory curator agents occupy a separate support
+lane because they cannot spawn descendants. Directional edges show the exact spawning parent,
+and the pyramid reflows only when topology or filters change, preserving manual positions during
+ordinary status updates.
