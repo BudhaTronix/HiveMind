@@ -26,6 +26,12 @@ from hivemind.config import Settings
 from hivemind.events import EventBus, redact_text
 from hivemind.governor import Governor
 from hivemind.memory import MemoryStore, create_memory_store
+from hivemind.observability import (
+    HandoffKind,
+    NullRuntimeObserver,
+    RuntimeObserver,
+    create_handoff,
+)
 from hivemind.persistence import ArtifactStore, HiveMindRepository
 from hivemind.providers import create_provider
 from hivemind.providers.base import LLMProvider, ProviderError
@@ -112,6 +118,7 @@ class HiveMindRuntime:
         registry: AgentRegistry | None = None,
         tool_registry: ToolRegistry | None = None,
         memory_store: MemoryStore | None = None,
+        observer: RuntimeObserver | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -122,6 +129,7 @@ class HiveMindRuntime:
         self.registry = registry or AgentRegistry(repository)
         self.tools = tool_registry or build_default_tool_registry()
         self.memory_store = memory_store or create_memory_store(settings, repository)
+        self.observer = observer or NullRuntimeObserver()
         self.memory_candidates: list[tuple[MemoryCandidate, str]] = []
         self._active_run: RunRecord | None = None
         self._role_providers: dict[AgentKind, LLMProvider] = {}
@@ -284,6 +292,18 @@ class HiveMindRuntime:
         )
 
         while not qa.can_finalize and run.round_number < run.max_rounds:
+            await self._handoff_ids(
+                run,
+                source_agent_id=qa_agent.agent_id,
+                target_agent_id=ceo.agent_id,
+                kind=HandoffKind.FOLLOW_UP,
+                title="Follow-up research requested",
+                summary=f"QA requested work on {len(qa.identified_gaps)} gap(s).",
+                payload={
+                    "identified_gaps": qa.identified_gaps,
+                    "follow_up_questions": qa.follow_up_questions,
+                },
+            )
             await self.events.emit(
                 EventType.REPLAN_REQUESTED,
                 run.run_id,
@@ -497,6 +517,21 @@ class HiveMindRuntime:
         agents.extend(managers)
         for manager in managers:
             await self._spawn(run, manager)
+        for manager, department in zip(managers, departments, strict=True):
+            await self._handoff(
+                run,
+                source=ceo,
+                target=manager,
+                kind=HandoffKind.ASSIGNMENT,
+                title=f"Lead {department.name}",
+                summary=department.objective,
+                payload={
+                    "department": department.name,
+                    "objective": department.objective,
+                    "rationale_summary": department.rationale_summary,
+                    "suggested_tools": department.suggested_tools,
+                },
+            )
 
         await self._stage(
             run, RunStage.MANAGERS_PLANNING, "Managers are planning teams concurrently."
@@ -542,8 +577,22 @@ class HiveMindRuntime:
                 worker_profiles.append((spec, profile))
             counted_agents += len(worker_profiles)
             agents.extend(profile for _, profile in worker_profiles)
-            for _, profile in worker_profiles:
+            for spec, profile in worker_profiles:
                 await self._spawn(run, profile)
+                await self._handoff(
+                    run,
+                    source=manager,
+                    target=profile,
+                    kind=HandoffKind.ASSIGNMENT,
+                    title=f"Research assignment: {spec.role}",
+                    summary=spec.objective,
+                    payload={
+                        "worker_role": spec.role,
+                        "objective": spec.objective,
+                        "research_questions": spec.research_questions,
+                        "approved_search_queries": spec.search_queries,
+                    },
+                )
             teams.append(DepartmentTeam(department, manager, worker_profiles))
 
         if manager_plan_results and all(
@@ -587,6 +636,20 @@ class HiveMindRuntime:
         """Verify all accumulated claims, then independently review research quality."""
 
         claims = [claim for report in manager_reports for claim in report.merged_claims]
+        source_agent_id = verifier.parent_agent_id or verifier.agent_id
+        await self._handoff_ids(
+            run,
+            source_agent_id=source_agent_id,
+            target_agent_id=verifier.agent_id,
+            kind=HandoffKind.VERIFICATION,
+            title="Verification packet",
+            summary=f"Validate {len(claims)} claim(s) against {len(evidence)} evidence record(s).",
+            payload={
+                "claim_count": len(claims),
+                "evidence_count": len(evidence),
+                "description": "Validated claims and referenced evidence for independent review.",
+            },
+        )
         await self._stage(run, RunStage.VERIFYING, "Verifier is checking claim references.")
         await self.events.emit(
             EventType.VERIFICATION_STARTED,
@@ -617,6 +680,19 @@ class HiveMindRuntime:
             f"Verifier checked {len(verification.findings)} claim(s).",
             round_number=run.round_number,
             agent_id=verifier.agent_id,
+        )
+
+        status_counts = {status.value: 0 for status in VerificationStatus}
+        for finding in verification.findings:
+            status_counts[finding.status.value] += 1
+        await self._handoff(
+            run,
+            source=verifier,
+            target=qa_agent,
+            kind=HandoffKind.VERIFICATION,
+            title="Verification results",
+            summary=verification.summary,
+            payload={"summary": verification.summary, "status_counts": status_counts},
         )
 
         await self._stage(run, RunStage.QUALITY_REVIEW, "QA is reviewing coverage and evidence.")
@@ -650,6 +726,22 @@ class HiveMindRuntime:
             f"QA found {len(qa.identified_gaps)} gap(s); can finalize: {qa.can_finalize}.",
             round_number=run.round_number,
             agent_id=qa_agent.agent_id,
+        )
+        await self._handoff_ids(
+            run,
+            source_agent_id=qa_agent.agent_id,
+            target_agent_id=qa_agent.parent_agent_id or qa_agent.agent_id,
+            kind=HandoffKind.QUALITY_REVIEW,
+            title="Quality review",
+            summary=f"QA score {qa.quality_score:.0%}; can finalize: {qa.can_finalize}.",
+            payload={
+                "quality_score": qa.quality_score,
+                "coverage_score": qa.coverage_score,
+                "evidence_score": qa.evidence_score,
+                "can_finalize": qa.can_finalize,
+                "identified_gaps": qa.identified_gaps,
+                "follow_up_questions": qa.follow_up_questions,
+            },
         )
         return verification, qa
 
@@ -712,6 +804,22 @@ class HiveMindRuntime:
             manager,
             f"{manager.name} synthesized {len(reports)} worker report(s).",
             llm_calls=1,
+        )
+        await self._handoff_ids(
+            run,
+            source_agent_id=manager.agent_id,
+            target_agent_id=manager.parent_agent_id or manager.agent_id,
+            kind=HandoffKind.MANAGER_REPORT,
+            title=f"{team.department.name} synthesis",
+            summary=report.summary,
+            payload={
+                "summary": report.summary,
+                "agreements": report.agreements,
+                "conflicts": report.conflicts,
+                "research_gaps": report.research_gaps,
+                "recommended_follow_up": report.recommended_follow_up,
+                "claim_count": len(report.merged_claims),
+            },
         )
         return report
 
@@ -782,6 +890,22 @@ class HiveMindRuntime:
                 "A semaphore limits simultaneous model requests; the model server decides "
                 "how those requests use its hardware."
             ),
+        )
+        await self._handoff_ids(
+            run,
+            source_agent_id=worker.agent_id,
+            target_agent_id=worker.parent_agent_id or worker.agent_id,
+            kind=HandoffKind.WORKER_REPORT,
+            title=f"Research report from {worker.name}",
+            summary=report.summary,
+            payload={
+                "summary": report.summary,
+                "important_findings": report.important_findings,
+                "open_questions": report.open_questions,
+                "conflicts": report.conflicts,
+                "claim_count": len(report.claims),
+                "evidence_count": len(worker_evidence),
+            },
         )
         return WorkerOutcome(report=report)
 
@@ -885,6 +1009,21 @@ class HiveMindRuntime:
                         item for item in candidate.source_evidence_ids if item in valid_evidence_ids
                     ]
                 }
+            )
+            await self._handoff_ids(
+                run,
+                source_agent_id=source_agent_id,
+                target_agent_id=curator.agent_id,
+                kind=HandoffKind.MEMORY_CANDIDATE,
+                title="Memory candidate for curation",
+                summary=candidate.text,
+                payload={
+                    "text": candidate.text,
+                    "memory_type": candidate.memory_type.value,
+                    "confidence": candidate.confidence,
+                    "source_evidence_ids": candidate.source_evidence_ids,
+                },
+                task_id=f"memory-candidate-{index}",
             )
             decision = await run_memory_curator(
                 self.executor,
@@ -1116,6 +1255,56 @@ class HiveMindRuntime:
                 )
             },
         )
+
+    async def _handoff(
+        self,
+        run: RunRecord,
+        *,
+        source: AgentProfile,
+        target: AgentProfile,
+        kind: HandoffKind,
+        title: str,
+        summary: str,
+        payload: dict[str, object],
+        task_id: str | None = None,
+    ) -> None:
+        await self._handoff_ids(
+            run,
+            source_agent_id=source.agent_id,
+            target_agent_id=target.agent_id,
+            kind=kind,
+            title=title,
+            summary=summary,
+            payload=payload,
+            task_id=task_id,
+        )
+
+    async def _handoff_ids(
+        self,
+        run: RunRecord,
+        *,
+        source_agent_id: str,
+        target_agent_id: str,
+        kind: HandoffKind,
+        title: str,
+        summary: str,
+        payload: dict[str, object],
+        task_id: str | None = None,
+    ) -> None:
+        """Publish validated public workflow data without affecting terminal events."""
+
+        handoff = create_handoff(
+            run_id=run.run_id,
+            round_number=run.round_number,
+            source_agent_id=source_agent_id,
+            target_agent_id=target_agent_id,
+            task_id=task_id,
+            kind=kind,
+            title=title,
+            summary=summary,
+            payload_preview=payload,
+        )
+        await self.observer.publish_handoff(handoff)
 
     async def _spawn(self, run: RunRecord, agent: AgentProfile) -> None:
         await self.registry.save(agent)

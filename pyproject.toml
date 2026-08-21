@@ -28,6 +28,10 @@ dependencies = [
 
 [project.optional-dependencies]
 mem0 = ["mem0ai>=2.0.16,<3"]
+web = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+]
 dev = [
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.24,<2",
@@ -36,6 +40,7 @@ dev = [
 
 [project.scripts]
 hivemind = "hivemind.cli:app"
+hivemind-web = "hivemind.web.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

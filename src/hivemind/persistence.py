@@ -15,6 +15,7 @@ from typing import Any
 import aiosqlite
 from pydantic import BaseModel
 
+from hivemind.observability import AgentHandoff
 from hivemind.schemas import (
     AgentProfile,
     Evidence,
@@ -29,7 +30,7 @@ from hivemind.schemas import (
     utc_now,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class HiveMindRepository:
@@ -326,6 +327,53 @@ class HiveMindRepository:
         )
         return [HiveEvent.model_validate_json(row[0]) for row in rows]
 
+    async def save_handoff(self, handoff: AgentHandoff) -> None:
+        """Upsert one idempotently identified public handoff."""
+
+        await self.initialize()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO handoffs(
+                    handoff_id, run_id, round_number, source_agent_id,
+                    target_agent_id, task_id, kind, created_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(handoff_id) DO UPDATE SET payload_json = excluded.payload_json
+                """,
+                (
+                    handoff.handoff_id,
+                    handoff.run_id,
+                    handoff.round_number,
+                    handoff.source_agent_id,
+                    handoff.target_agent_id,
+                    handoff.task_id,
+                    handoff.kind.value,
+                    handoff.created_at.isoformat(),
+                    handoff.model_dump_json(),
+                ),
+            )
+            await db.commit()
+
+    async def list_handoffs(self, run_id: str) -> list[AgentHandoff]:
+        rows = await self._fetchall(
+            "SELECT payload_json FROM handoffs WHERE run_id = ? ORDER BY created_at, handoff_id",
+            (run_id,),
+        )
+        return [AgentHandoff.model_validate_json(row[0]) for row in rows]
+
+    async def list_handoffs_for_agent(
+        self, run_id: str, agent_id: str
+    ) -> list[AgentHandoff]:
+        rows = await self._fetchall(
+            """
+            SELECT payload_json FROM handoffs
+            WHERE run_id = ? AND (source_agent_id = ? OR target_agent_id = ?)
+            ORDER BY created_at, handoff_id
+            """,
+            (run_id, agent_id, agent_id),
+        )
+        return [AgentHandoff.model_validate_json(row[0]) for row in rows]
+
     async def save_evidence(self, item: Evidence) -> None:
         await self.initialize()
         async with aiosqlite.connect(self.path) as db:
@@ -410,6 +458,51 @@ class HiveMindRepository:
         sql += " ORDER BY round_number DESC LIMIT 1"
         row = await self._fetchone(sql, params)
         return str(row[0]) if row else None
+
+    async def list_reports_for_agent(self, run_id: str, agent_id: str) -> list[dict[str, Any]]:
+        rows = await self._fetchall(
+            """
+            SELECT report_type, round_number, created_at, payload_json
+            FROM reports WHERE run_id = ? AND task_id = ?
+            ORDER BY created_at
+            """,
+            (run_id, agent_id),
+        )
+        return [
+            {
+                "report_type": row[0],
+                "round_number": row[1],
+                "created_at": row[2],
+                "data": json.loads(row[3]),
+            }
+            for row in rows
+        ]
+
+    async def list_tool_calls(
+        self, run_id: str, *, agent_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT tool_call_id, agent_id, task_id, tool_name, status, created_at, payload_json
+            FROM tool_calls WHERE run_id = ?
+        """
+        params: tuple[object, ...] = (run_id,)
+        if agent_id is not None:
+            sql += " AND agent_id = ?"
+            params += (agent_id,)
+        sql += " ORDER BY created_at"
+        rows = await self._fetchall(sql, params)
+        return [
+            {
+                "tool_call_id": row[0],
+                "agent_id": row[1],
+                "task_id": row[2],
+                "tool_name": row[3],
+                "status": row[4],
+                "created_at": row[5],
+                "event": json.loads(row[6]),
+            }
+            for row in rows
+        ]
 
     async def save_checkpoint(self, run_id: str, key: str, payload: BaseModel) -> None:
         await self.save_report(run_id, f"checkpoint:{key}", payload, round_number=0)
@@ -728,11 +821,25 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     created_at TEXT NOT NULL,
     payload_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS handoffs (
+    handoff_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    round_number INTEGER NOT NULL,
+    source_agent_id TEXT NOT NULL,
+    target_agent_id TEXT NOT NULL,
+    task_id TEXT,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id);
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope, scope_id, status);
+CREATE INDEX IF NOT EXISTS idx_handoffs_run ON handoffs(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_handoffs_source ON handoffs(run_id, source_agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_handoffs_target ON handoffs(run_id, target_agent_id, created_at);
 """
 
 

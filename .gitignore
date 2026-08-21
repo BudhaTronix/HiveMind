@@ -10,4 +10,6 @@ data/*
 !data/.gitkeep
 runs/*
 !runs/.gitkeep
-
+web/node_modules/
+web/dist/
+web/coverage/
